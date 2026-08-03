@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"fmt"
@@ -35,18 +35,22 @@ func main() {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	buf := make([]byte, 1024) // Create a buffer to hold incoming data, 1024 bytes because that's the maximum size of a Kafka message
+	req, err := RecieveRequest(conn)
 
-	_, err := conn.Read(buf) // Load conn data into the buffer
 	if err != nil {
-		fmt.Println("Error reading data: ", err.Error())
-		return
+		fmt.Println("Error receiving request: ", err.Error())
+		os.Exit(1)
 	}
 
-	_, err = conn.Write([]byte{0, 0, 0, 1, 0, 0, 0, 7}) // 8 bytes total, 0001 (any value) is for message_size and 0007 is for correlation_id (must be 7)
+	resp := &Response{
+		MsgSize:       0,
+		CorrelationID: req.CorrelationID,
+	}
+
+	err = resp.SendResp(conn)
 
 	if err != nil {
-		fmt.Println("Error writing data: ", err.Error())
-		return
+		fmt.Println("Error sending response: ", err.Error())
+		os.Exit(1)
 	}
 }
