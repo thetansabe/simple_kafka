@@ -1,0 +1,18 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build-kafka",
+            "type": "shell",
+            "command": "go build -gcflags='all=-N -l' -o /tmp/codecrafters-build-kafka-go ${workspaceFolder}/app/*.go",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always"
+            },
+            "problemMatcher": "$go"
+        }
+    ]
+}

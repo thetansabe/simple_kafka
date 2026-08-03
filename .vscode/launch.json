@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Kafka Server",
+      "type": "go",
+      "request": "launch",
+      "mode": "exec",
+      "program": "/tmp/codecrafters-build-kafka-go",
+      "preLaunchTask": "build-kafka"
+    }
+  ]
+}

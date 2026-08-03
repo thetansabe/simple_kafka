@@ -1,6 +1,9 @@
-package app
+package main
 
-import "net"
+import (
+	"log"
+	"net"
+)
 
 func RecieveRequest(conn net.Conn) (*Request, error) {
 	var buf = make([]byte, 1024) // 1024 is reasonable buffer size, as kafka msg is limited to 255 bytes
@@ -34,8 +37,19 @@ func RecieveRequest(conn net.Conn) (*Request, error) {
 }
 
 func (resp *Response) SendResp(conn net.Conn) error {
-	_, err := conn.Write([]byte{byte(0), byte(0), byte(0), byte(0),
+	log.Printf("Sending response: CorrelationID=%d, ErrorCode=%d", resp.CorrelationID, resp.ErrorCode)
+
+	body := []byte{
+		// correlation_id (4 bytes)
 		byte(resp.CorrelationID >> 24), byte(resp.CorrelationID >> 16),
-		byte(resp.CorrelationID >> 8), byte(resp.CorrelationID)})
+		byte(resp.CorrelationID >> 8), byte(resp.CorrelationID),
+		// error_code (2 bytes)
+		byte(resp.ErrorCode >> 8), byte(resp.ErrorCode),
+	}
+	msgSize := int32(len(body))
+	frame := []byte{
+		byte(msgSize >> 24), byte(msgSize >> 16), byte(msgSize >> 8), byte(msgSize),
+	}
+	_, err := conn.Write(append(frame, body...))
 	return err
 }
