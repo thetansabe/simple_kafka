@@ -41,26 +41,12 @@ func handleConnection(conn net.Conn) {
 		os.Exit(1)
 	}
 
-	resp := &Response{
-		CorrelationID: req.CorrelationID,
-		ErrorCode:     errorCodeFor(req),
-	}
+	resp := &Response{}
+	resp.Init(req)
 
 	err = resp.SendResp(conn)
 	if err != nil {
 		fmt.Println("Error sending response: ", err.Error())
 		os.Exit(1)
-	}
-}
-
-func errorCodeFor(req *Request) int16 {
-	switch req.APIKey {
-	case APIKeyApiVersions:
-		if req.APIVersion < 0 || req.APIVersion > 4 {
-			return ErrUnsupportedVersion
-		}
-		return ErrNone
-	default:
-		return ErrUnsupportedVersion
 	}
 }
