@@ -44,7 +44,7 @@ func handleConnection(conn net.Conn) {
 	resp := &Response{}
 	resp.Init(req)
 
-	err = resp.SendResp(conn)
+	err = resp.SendResp(conn, req)
 	if err != nil {
 		fmt.Println("Error sending response: ", err.Error())
 		os.Exit(1)

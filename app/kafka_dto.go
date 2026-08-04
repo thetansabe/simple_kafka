@@ -1,10 +1,12 @@
 package main
 
 const (
-	APIKeyApiVersions int16 = 18
+	APIKeyApiVersions         int16 = 18
+	DESCRIBE_TOPIC_PARTITIONS int16 = 75
 
-	ErrNone               int16 = 0
-	ErrUnsupportedVersion int16 = 35
+	ErrNone                    int16 = 0
+	ErrUnsupportedVersion      int16 = 35
+	UNKNOWN_TOPIC_OR_PARTITION int16 = 3
 )
 
 type RequestHeader struct {
@@ -14,8 +16,6 @@ type RequestHeader struct {
 	ClientID      string
 	OptionalTags  struct{}
 }
-
-type RequestBody struct{}
 
 type Request struct {
 	MsgSize int32
@@ -31,8 +31,10 @@ type Response struct {
 	// body
 	ErrorCode      int16
 	APIKeys        []APIKey // compact array - list of specified struct
-	ThrottleTimeMS int32    // throttle time in milliseconds
-	TagBuffer      byte     //optional tagged fields just as RequestHeader.OptionalTags
+	Topics         []TopicForResp
+	NextCursor     byte  // cursor for pagination
+	ThrottleTimeMS int32 // throttle time in milliseconds
+	TagBuffer      byte  //optional tagged fields just as RequestHeader.OptionalTags
 }
 
 type APIKey struct {
@@ -41,3 +43,30 @@ type APIKey struct {
 	MaxVersion int16
 	TagBuffer  byte
 }
+
+// Topics
+
+type Topic struct {
+	TopicName string
+	TagBuffer byte
+}
+
+type RequestBody struct {
+	Topics           []Topic // compact array - list of specified struct
+	RespPartitionLim int32   // limits number of partitions returned in the response
+	Cursor           byte    // cursor for pagination
+	TagBuffer        byte    // optional tagged fields
+}
+
+type TopicForResp struct {
+	ErrCode                   int16       // err code
+	TopicName                 string      // the topic name from the request
+	TopicID                   [16]byte    // topic uuid, 16 bytes
+	IsInternal                bool        // whether topic is internal
+	Partitions                []Partition //	array of partition metadata	(empty for unknown)
+	TopicAuthorizedOperations int32       // authorized operations bitfield (0)
+	TagBuffer                 byte        // tagged fields, 0 so far
+}
+
+// left blank, since IDK what it is so far
+type Partition struct{}
