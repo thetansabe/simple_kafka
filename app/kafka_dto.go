@@ -7,6 +7,14 @@ const (
 	ErrNone                    int16 = 0
 	ErrUnsupportedVersion      int16 = 35
 	UNKNOWN_TOPIC_OR_PARTITION int16 = 3
+
+	BrokerRecord          = 0x00
+	TopicRecordWait       = 0x01
+	TopicRecord           = 0x02
+	PartitionRecord       = 0x03
+	ConfigRecord          = 0x04
+	PartitionChangeRecord = 0x05
+	FeatureLevelRecord    = 0x0C
 )
 
 type RequestHeader struct {
@@ -69,4 +77,20 @@ type TopicForResp struct {
 }
 
 // left blank, since IDK what it is so far
-type Partition struct{}
+type Partition struct {
+	ErrCode                int16   // 0 for valid partitions
+	PartitionIndex         int32   // partition ID, fuck, no better naming?
+	LeaderID               int32   // broker ID hosting this partition
+	LeaderEpoch            int32   // leader epoch
+	ReplicaNodes           []int32 // array of replica broker IDs
+	IsrNodes               []int32 // array of in-sync replica broker IDs
+	EligibleLeaderReplicas []int32 // array of eligible leader replica broker IDs
+	LastKnownElr           []int32 // array of last known eligible leader replicas
+	OfflineReplicas        []int32 // array of offline replica broker IDs
+	TagBuffer              byte
+}
+
+type LogMetadata struct {
+	Name       string
+	Partitions []Partition
+}

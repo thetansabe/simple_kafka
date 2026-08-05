@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net"
+	"os"
 )
 
 func (resp *Response) Init(req *Request) {
@@ -33,7 +34,8 @@ func (resp *Response) Init(req *Request) {
 				TopicAuthorizedOperations: 0,
 			})
 		}
-		resp.NextCursor = 0xff // null cursor
+		resp.NextCursor = 0xff     // null cursor
+		resp.LoadClusterMetadata() // load cluster metadata from the log file
 
 	default:
 		resp.ErrorCode = ErrUnsupportedVersion
@@ -103,7 +105,7 @@ func (resp *Response) SendResp(conn net.Conn, req *Request) error {
 	case DESCRIBE_TOPIC_PARTITIONS:
 		res = resp.ConstructResponseForDescribeTopic()
 	}
-	
+
 	msgSize := int32(len(res))
 
 	// frame is the first 4 bytes of the response, which is the size of the response
@@ -213,4 +215,161 @@ func (resp *Response) ConstructResponseForDescribeTopic() (res []byte) {
 	// body tag_buffer
 	res = append(res, resp.TagBuffer)
 	return res
+}
+
+// read this: https://binspec.org/kafka-cluster-metadata?highlight=0-90
+// to know the offset of each field in the input content []byte
+func LogMetadataMapByUuid(content []byte) (m map[[16]byte]LogMetadata) {
+	m = make(map[[16]byte]LogMetadata)
+
+	cursor := 8 // skip first as they are batch offset
+	batchLen := int(content[cursor])<<24 | int(content[cursor+1])<<16 | int(content[cursor+2])<<8 | int(content[cursor+3])
+
+	// skip Record Batch#1
+	cursor = 12 + batchLen //12 is the size of byte before batchLen, and batchLen is the size of the part behind it
+
+	// we are at record batch #2, to jump into record #1
+	// we need to skip 8+4+4+1+4+2+4+8+8+8+2+4+4=61 bytes
+	cursor += 61
+
+	// now we are at the start of the first Record which contains metadata and Value of topic record
+	for cursor < len(content) {
+		// at this moment, we are at Length of the record, which maybe 1 or 2 bytes, don't know
+		// Kafka chose LEB128 varint encoding: "I will use bit 7 as a signal: if I set it to 1, it means 'I'm not done yet, read the next byte too'."
+		// step 1: >> 7: we are moving bit 7th (MSB) to the 0th (LSB) position
+		// bits:    7 6 5 4 3 2 1 0
+		// before:  1 0 1 0 1 1 0 0
+		// after:   0 0 0 0 0 0 0 1
+		// step 2: &1,
+		// if it is 0 then the length is 1 byte (decide by Kafka's LEB128)
+		// else if it is 1 then the length is 2 bytes (decide by Kafka's LEB128)
+		switch (content[cursor] >> 7) & 1 {
+		case 0:
+		case 1:
+			// skip the next byte, since we are at the first byte of the length
+			cursor++
+		}
+
+		// we are in the last byte of the length, let's skip 5 bytes to reach Value Length field, and it also a varint (LEB128)
+		cursor += 5 // skip attributes, timestamp_delta, offset_delta, key length, and key(null), to value_length
+
+		// cursor to last byte of Value Length
+		switch (content[cursor] >> 7) & 1 {
+		case 0:
+			// value length takes 1 byte
+			// valueLen := int(content[cursor])
+		case 1:
+			// value length takes 2 bytes
+			// valueLen := int(content[cursor])<<8 + int(content[cursor])
+			cursor++
+		}
+
+		// cursor+2 is Value's Type field
+		if content[cursor+2] == TopicRecord { // this record belongs to a topic
+			cursor += 4                         // skip frame_version, type, and version, to the name_length
+			nameLen := int(content[cursor]) - 1 // minus 1, since name is a compact string (Kafka store str_len + 1)
+			cursor++                            // now at the first byte of topic name
+			topicName := string(content[cursor : cursor+nameLen])
+			cursor += nameLen
+
+			// topic UUID
+			var uuid [16]byte
+			for i := range 16 {
+				uuid[i] = content[cursor+i]
+			}
+
+			m[uuid] = LogMetadata{
+				Name:       topicName,
+				Partitions: m[uuid].Partitions, // keep the previous partitions if any
+			}
+
+			cursor += 18 // skip tagged fields count and headers array count, which are all 0 so far
+		} else {
+			// this record belongs to a partition, with type=0x03,
+			// takes Record#2 Value with Partition Record example here: https://binspec.org/kafka-cluster-metadata?highlight=215-218
+
+			cursor += 4 // skip frame version, type, and version
+			// now we are at the Partition ID part, which is a 4 byte value
+			partition := Partition{
+				PartitionIndex: int32(content[cursor])<<24 + int32(content[cursor+1])<<16 + int32(content[cursor+2])<<8 + int32(content[cursor+3]),
+			}
+			cursor += 4
+			// belonging topic uuid
+			topicUUID := [16]byte{0}
+			for i := range 16 {
+				topicUUID[i] = content[cursor+i]
+			}
+			cursor += 16
+
+			// replica array, as well as replica nodes
+			replicaArrayLen := int(content[cursor]) - 1
+			cursor++
+
+			for range replicaArrayLen {
+				partition.ReplicaNodes = append(partition.ReplicaNodes, int32(content[cursor])<<24+int32(content[cursor+1])<<16+int32(content[cursor+2])<<8+int32(content[cursor+3]))
+				cursor += 4
+			}
+
+			// length of removing replicas array and adding replicas array, ignored as empty
+			cursor += 2
+			// LeaderID
+			partition.LeaderID = int32(content[cursor])<<24 + int32(content[cursor+1])<<16 + int32(content[cursor+2])<<8 + int32(content[cursor+3])
+			cursor += 4
+			// LeaderEpoch
+			partition.LeaderEpoch = int32(content[cursor])<<24 + int32(content[cursor+1])<<16 + int32(content[cursor+2])<<8 + int32(content[cursor+3])
+			cursor += 4
+			// partition epoch
+			cursor += 4
+			// length of directories array
+			directoriesArrayLen := int(content[cursor]) - 1
+			cursor++
+			// directories array, 16 bytes each elem
+			for range directoriesArrayLen {
+				cursor += 16
+			}
+			// tagged fields count
+			partition.TagBuffer = 0
+			cursor++
+			// headers array count
+			cursor++
+
+			m[topicUUID] = LogMetadata{
+				Name:       m[topicUUID].Name,
+				Partitions: append(m[topicUUID].Partitions, partition),
+			}
+		}
+	}
+
+	return
+}
+
+func (resp *Response) LoadClusterMetadata() error {
+	content, err := os.ReadFile("/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log")
+	if err != nil {
+		return err
+	}
+
+	log.Println("Will ParseClusterMetadataLog fail?")
+
+	m := LogMetadataMapByUuid(content)
+
+	log.Println("ParseClusterMetadataLog didn't fail")
+
+	for i := range resp.Topics {
+		for uuid, metadata := range m {
+			if metadata.Name == resp.Topics[i].TopicName {
+				resp.Topics[i].TopicID = uuid
+				resp.Topics[i].ErrCode = ErrNone // set to 0
+				break
+			}
+		}
+
+		// append the partitions read from the log file into the response's topic partitions
+		// resp.Topics[i].Partitions = m[resp.Topics[i].TopicID].Partitions
+		for _, p := range m[resp.Topics[i].TopicID].Partitions {
+			resp.Topics[i].Partitions = append(resp.Topics[i].Partitions, p)
+		}
+	}
+
+	return nil
 }
