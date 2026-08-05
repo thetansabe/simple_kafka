@@ -242,47 +242,52 @@ func (resp *Response) ConstructResponseForDescribeTopic() (res []byte) {
 func LogMetadataMapByUuid(content []byte) map[[16]byte]LogMetadata {
 	m := make(map[[16]byte]LogMetadata)
 
-	// batch 1: baseOffset(8) + batchLength(4) + body(batchLen bytes)
+	// skip batch 1 (only contains FeatureLevel/Broker records, no topic/partition data)
 	batch1Len := int(content[8])<<24 | int(content[9])<<16 | int(content[10])<<8 | int(content[11])
-	batch2Start := 12 + batch1Len
+	batchStart := 12 + batch1Len
 
-	// batch 2: read its batchLength to know where batch 2 ends, so we don't bleed into batch 3
-	batch2Len := int(content[batch2Start+8])<<24 | int(content[batch2Start+9])<<16 | int(content[batch2Start+10])<<8 | int(content[batch2Start+11])
-	batch2End := batch2Start + 12 + batch2Len
+	// now the log file contains many batches, each containing a topic record and one or more partition records
+	// we need to read all batches
+	for batchStart+12 <= len(content) {
+		batchLen := int(content[batchStart+8])<<24 | int(content[batchStart+9])<<16 | int(content[batchStart+10])<<8 | int(content[batchStart+11])
+		batchEnd := batchStart + 12 + batchLen
+		if batchEnd > len(content) {
+			break
+		}
+		parseBatchRecords(content, batchStart, batchEnd, m)
+		batchStart = batchEnd
+	}
 
-	// skip batch 2's RecordBatch header (8+4+4+1+4+2+4+8+8+8+2+4+4 = 61 bytes)
-	cursor := batch2Start + 61
+	return m
+}
 
-	for cursor < batch2End && cursor < len(content) {
-		// at this moment, we are at Length of the record, which maybe 1 or 2 bytes, don't know
-		// Kafka chose LEB128 varint encoding: "I will use bit 7 as a signal: if I set it to 1, it means 'I'm not done yet, read the next byte too'."
-		// step 1: >> 7: we are moving bit 7th (MSB) to the 0th (LSB) position
-		// bits:    7 6 5 4 3 2 1 0
-		// before:  1 0 1 0 1 1 0 0
-		// after:   0 0 0 0 0 0 0 1
-		// step 2: &1,
-		// if it is 0 then the length is 1 byte (decide by Kafka's LEB128)
-		// else if it is 1 then the length is 2 bytes (decide by Kafka's LEB128)
+// parseBatchRecords reads all records in one RecordBatch and populates the map.
+// batchStart points to the start of the batch (baseOffset field).
+// batchEnd  points to the first byte AFTER this batch.
+func parseBatchRecords(content []byte, batchStart, batchEnd int, m map[[16]byte]LogMetadata) {
+	// skip the 61-byte RecordBatch header (8+4+4+1+4+2+4+8+8+8+2+4+4 = 61 bytes)
+	cursor := batchStart + 61
+
+	for cursor < batchEnd {
+		// Record length is a varint (LEB128): bit 7 = 1 means "one more byte follows"
 		if (content[cursor]>>7)&1 == 1 {
 			cursor++ // skip first byte of 2-byte varint
 		}
 		cursor++ // advance past last (or only) byte of record length
 
-		// skip: attributes(1) + timestampDelta(~1) + offsetDelta(~1) + keyLength(~1) + key(0 bytes, null)
+		// skip: attributes(1) + timestampDelta(1) + offsetDelta(1) + keyLength(1) + key(0, null)
 		cursor += 4
 
-		// cursor is on the first byte of value_length (signed varint LEB128, zigzag: stored as 2*n)
+		// value_length is a signed zigzag varint (stored as 2*n, decode with >>1)
 		var valueLen int
 		switch (content[cursor] >> 7) & 1 {
 		case 0:
-			valueLen = int(content[cursor]) >> 1 // zigzag decode: encoded = 2*n, so n = encoded>>1
+			valueLen = int(content[cursor]) >> 1
 		case 1:
 			valueLen = ((int(content[cursor]) & 0x7F) | ((int(content[cursor+1]) & 0x7F) << 7)) >> 1
 			cursor++ // cursor now on last byte of 2-byte varint
 		}
-		// cursor is now on the LAST byte of value_length
 
-		// cursor is now on the LAST byte of value_length
 		// cursor+1 = frame_version, cursor+2 = type, cursor+3 = version
 		valueStart := cursor + 1
 
@@ -308,7 +313,6 @@ func LogMetadataMapByUuid(content []byte) map[[16]byte]LogMetadata {
 			copy(topicUUID[:], content[cursor:cursor+16])
 			cursor += 16
 
-			// replicas compact array
 			replicaLen := int(content[cursor]) - 1
 			cursor++
 			for range replicaLen {
@@ -316,7 +320,6 @@ func LogMetadataMapByUuid(content []byte) map[[16]byte]LogMetadata {
 				cursor += 4
 			}
 
-			// isr compact array (was missing before — caused cursor misalignment)
 			isrLen := int(content[cursor]) - 1
 			cursor++
 			for range isrLen {
@@ -324,11 +327,9 @@ func LogMetadataMapByUuid(content []byte) map[[16]byte]LogMetadata {
 				cursor += 4
 			}
 
-			// removingReplicas compact array (skip)
 			removingLen := int(content[cursor]) - 1
 			cursor += 1 + removingLen*4
 
-			// addingReplicas compact array (skip)
 			addingLen := int(content[cursor]) - 1
 			cursor += 1 + addingLen*4
 
@@ -341,15 +342,13 @@ func LogMetadataMapByUuid(content []byte) map[[16]byte]LogMetadata {
 				Name:       m[topicUUID].Name,
 				Partitions: append(m[topicUUID].Partitions, partition),
 			}
-			// default: unknown record type (BrokerRecord, FeatureLevelRecord, etc.) — just skip
+			// default: unknown type (BrokerRecord, FeatureLevelRecord, etc.) — skip via valueLen below
 		}
 
-		// reliably advance to the next record using valueLen, regardless of how much of the
-		// value we actually parsed above. +1 skips the headersCount varint (always 0x00 here).
+		// always jump to the start of the next record, regardless of how much we parsed above
+		// +1 skips the headersCount varint (always 0x00)
 		cursor = valueStart + valueLen + 1
 	}
-
-	return m
 }
 
 func (resp *Response) LoadClusterMetadata() error {
