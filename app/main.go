@@ -35,18 +35,20 @@ func main() {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	req, err := RecieveRequest(conn)
-	if err != nil {
-		fmt.Println("Error receiving request: ", err.Error())
-		os.Exit(1)
-	}
+	for {
+		req, err := RecieveRequest(conn)
+		if err != nil {
+			// connection closed by client — normal end of session
+			return
+		}
 
-	resp := &Response{}
-	resp.Init(req)
+		resp := &Response{}
+		resp.Init(req)
 
-	err = resp.SendResp(conn, req)
-	if err != nil {
-		fmt.Println("Error sending response: ", err.Error())
-		os.Exit(1)
+		err = resp.SendResp(conn, req)
+		if err != nil {
+			fmt.Println("Error sending response: ", err.Error())
+			return
+		}
 	}
 }
