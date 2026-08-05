@@ -158,6 +158,14 @@ func (resp *Response) ConstructResponseForApiVersions() (res []byte) {
 	return res
 }
 
+func appendCompactInt32Array(res []byte, arr []int32) []byte {
+	res = append(res, byte(len(arr)+1)) // compact array length = real length + 1
+	for _, v := range arr {
+		res = append(res, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+	}
+	return res
+}
+
 func (resp *Response) ConstructResponseForDescribeTopic() (res []byte) {
 	/* ====== response header (flexible v1) ====== */
 	res = []byte{
@@ -196,8 +204,20 @@ func (resp *Response) ConstructResponseForDescribeTopic() (res []byte) {
 			res = append(res, 0)
 		}
 
-		// partitions compact array length (N+1, empty = 1)
+		// partitions compact array length (N+1)
 		res = append(res, byte(len(topic.Partitions)+1))
+		for _, p := range topic.Partitions {
+			res = append(res, byte(p.ErrCode>>8), byte(p.ErrCode))
+			res = append(res, byte(p.PartitionIndex>>24), byte(p.PartitionIndex>>16), byte(p.PartitionIndex>>8), byte(p.PartitionIndex))
+			res = append(res, byte(p.LeaderID>>24), byte(p.LeaderID>>16), byte(p.LeaderID>>8), byte(p.LeaderID))
+			res = append(res, byte(p.LeaderEpoch>>24), byte(p.LeaderEpoch>>16), byte(p.LeaderEpoch>>8), byte(p.LeaderEpoch))
+			res = appendCompactInt32Array(res, p.ReplicaNodes)
+			res = appendCompactInt32Array(res, p.IsrNodes)
+			res = appendCompactInt32Array(res, p.EligibleLeaderReplicas)
+			res = appendCompactInt32Array(res, p.LastKnownElr)
+			res = appendCompactInt32Array(res, p.OfflineReplicas)
+			res = append(res, p.TagBuffer)
+		}
 
 		// topic_authorized_operations (4 bytes)
 		res = append(res,
@@ -219,21 +239,21 @@ func (resp *Response) ConstructResponseForDescribeTopic() (res []byte) {
 
 // read this: https://binspec.org/kafka-cluster-metadata?highlight=0-90
 // to know the offset of each field in the input content []byte
-func LogMetadataMapByUuid(content []byte) (m map[[16]byte]LogMetadata) {
-	m = make(map[[16]byte]LogMetadata)
+func LogMetadataMapByUuid(content []byte) map[[16]byte]LogMetadata {
+	m := make(map[[16]byte]LogMetadata)
 
-	cursor := 8 // skip first as they are batch offset
-	batchLen := int(content[cursor])<<24 | int(content[cursor+1])<<16 | int(content[cursor+2])<<8 | int(content[cursor+3])
+	// batch 1: baseOffset(8) + batchLength(4) + body(batchLen bytes)
+	batch1Len := int(content[8])<<24 | int(content[9])<<16 | int(content[10])<<8 | int(content[11])
+	batch2Start := 12 + batch1Len
 
-	// skip Record Batch#1
-	cursor = 12 + batchLen //12 is the size of byte before batchLen, and batchLen is the size of the part behind it
+	// batch 2: read its batchLength to know where batch 2 ends, so we don't bleed into batch 3
+	batch2Len := int(content[batch2Start+8])<<24 | int(content[batch2Start+9])<<16 | int(content[batch2Start+10])<<8 | int(content[batch2Start+11])
+	batch2End := batch2Start + 12 + batch2Len
 
-	// we are at record batch #2, to jump into record #1
-	// we need to skip 8+4+4+1+4+2+4+8+8+8+2+4+4=61 bytes
-	cursor += 61
+	// skip batch 2's RecordBatch header (8+4+4+1+4+2+4+8+8+8+2+4+4 = 61 bytes)
+	cursor := batch2Start + 61
 
-	// now we are at the start of the first Record which contains metadata and Value of topic record
-	for cursor < len(content) {
+	for cursor < batch2End && cursor < len(content) {
 		// at this moment, we are at Length of the record, which maybe 1 or 2 bytes, don't know
 		// Kafka chose LEB128 varint encoding: "I will use bit 7 as a signal: if I set it to 1, it means 'I'm not done yet, read the next byte too'."
 		// step 1: >> 7: we are moving bit 7th (MSB) to the 0th (LSB) position
@@ -243,104 +263,93 @@ func LogMetadataMapByUuid(content []byte) (m map[[16]byte]LogMetadata) {
 		// step 2: &1,
 		// if it is 0 then the length is 1 byte (decide by Kafka's LEB128)
 		// else if it is 1 then the length is 2 bytes (decide by Kafka's LEB128)
+		if (content[cursor]>>7)&1 == 1 {
+			cursor++ // skip first byte of 2-byte varint
+		}
+		cursor++ // advance past last (or only) byte of record length
+
+		// skip: attributes(1) + timestampDelta(~1) + offsetDelta(~1) + keyLength(~1) + key(0 bytes, null)
+		cursor += 4
+
+		// cursor is on the first byte of value_length (signed varint LEB128, zigzag: stored as 2*n)
+		var valueLen int
 		switch (content[cursor] >> 7) & 1 {
 		case 0:
+			valueLen = int(content[cursor]) >> 1 // zigzag decode: encoded = 2*n, so n = encoded>>1
 		case 1:
-			// skip the next byte, since we are at the first byte of the length
-			cursor++
+			valueLen = ((int(content[cursor]) & 0x7F) | ((int(content[cursor+1]) & 0x7F) << 7)) >> 1
+			cursor++ // cursor now on last byte of 2-byte varint
 		}
+		// cursor is now on the LAST byte of value_length
 
-		// we are in the last byte of the length, let's skip 5 bytes to reach Value Length field, and it also a varint (LEB128)
-		cursor += 5 // skip attributes, timestamp_delta, offset_delta, key length, and key(null), to value_length
+		// cursor is now on the LAST byte of value_length
+		// cursor+1 = frame_version, cursor+2 = type, cursor+3 = version
+		valueStart := cursor + 1
 
-		// cursor to last byte of Value Length
-		switch (content[cursor] >> 7) & 1 {
-		case 0:
-			// value length takes 1 byte
-			// valueLen := int(content[cursor])
-		case 1:
-			// value length takes 2 bytes
-			// valueLen := int(content[cursor])<<8 + int(content[cursor])
+		switch content[cursor+2] {
+		case TopicRecord:
+			cursor += 4                         // skip: value_length last byte + frame_version + type + version
+			nameLen := int(content[cursor]) - 1 // compact string: stored len = real len + 1
 			cursor++
-		}
-
-		// cursor+2 is Value's Type field
-		if content[cursor+2] == TopicRecord { // this record belongs to a topic
-			cursor += 4                         // skip frame_version, type, and version, to the name_length
-			nameLen := int(content[cursor]) - 1 // minus 1, since name is a compact string (Kafka store str_len + 1)
-			cursor++                            // now at the first byte of topic name
 			topicName := string(content[cursor : cursor+nameLen])
 			cursor += nameLen
-
-			// topic UUID
 			var uuid [16]byte
-			for i := range 16 {
-				uuid[i] = content[cursor+i]
-			}
+			copy(uuid[:], content[cursor:cursor+16])
+			m[uuid] = LogMetadata{Name: topicName, Partitions: m[uuid].Partitions}
 
-			m[uuid] = LogMetadata{
-				Name:       topicName,
-				Partitions: m[uuid].Partitions, // keep the previous partitions if any
-			}
-
-			cursor += 18 // skip tagged fields count and headers array count, which are all 0 so far
-		} else {
-			// this record belongs to a partition, with type=0x03,
-			// takes Record#2 Value with Partition Record example here: https://binspec.org/kafka-cluster-metadata?highlight=215-218
-
-			cursor += 4 // skip frame version, type, and version
-			// now we are at the Partition ID part, which is a 4 byte value
+		case PartitionRecord:
+			cursor += 4 // skip: value_length last byte + frame_version + type + version
 			partition := Partition{
-				PartitionIndex: int32(content[cursor])<<24 + int32(content[cursor+1])<<16 + int32(content[cursor+2])<<8 + int32(content[cursor+3]),
+				PartitionIndex: int32(content[cursor])<<24 | int32(content[cursor+1])<<16 | int32(content[cursor+2])<<8 | int32(content[cursor+3]),
 			}
 			cursor += 4
-			// belonging topic uuid
-			topicUUID := [16]byte{0}
-			for i := range 16 {
-				topicUUID[i] = content[cursor+i]
-			}
+
+			var topicUUID [16]byte
+			copy(topicUUID[:], content[cursor:cursor+16])
 			cursor += 16
 
-			// replica array, as well as replica nodes
-			replicaArrayLen := int(content[cursor]) - 1
+			// replicas compact array
+			replicaLen := int(content[cursor]) - 1
 			cursor++
-
-			for range replicaArrayLen {
-				partition.ReplicaNodes = append(partition.ReplicaNodes, int32(content[cursor])<<24+int32(content[cursor+1])<<16+int32(content[cursor+2])<<8+int32(content[cursor+3]))
+			for range replicaLen {
+				partition.ReplicaNodes = append(partition.ReplicaNodes, int32(content[cursor])<<24|int32(content[cursor+1])<<16|int32(content[cursor+2])<<8|int32(content[cursor+3]))
 				cursor += 4
 			}
 
-			// length of removing replicas array and adding replicas array, ignored as empty
-			cursor += 2
-			// LeaderID
-			partition.LeaderID = int32(content[cursor])<<24 + int32(content[cursor+1])<<16 + int32(content[cursor+2])<<8 + int32(content[cursor+3])
-			cursor += 4
-			// LeaderEpoch
-			partition.LeaderEpoch = int32(content[cursor])<<24 + int32(content[cursor+1])<<16 + int32(content[cursor+2])<<8 + int32(content[cursor+3])
-			cursor += 4
-			// partition epoch
-			cursor += 4
-			// length of directories array
-			directoriesArrayLen := int(content[cursor]) - 1
+			// isr compact array (was missing before — caused cursor misalignment)
+			isrLen := int(content[cursor]) - 1
 			cursor++
-			// directories array, 16 bytes each elem
-			for range directoriesArrayLen {
-				cursor += 16
+			for range isrLen {
+				partition.IsrNodes = append(partition.IsrNodes, int32(content[cursor])<<24|int32(content[cursor+1])<<16|int32(content[cursor+2])<<8|int32(content[cursor+3]))
+				cursor += 4
 			}
-			// tagged fields count
-			partition.TagBuffer = 0
-			cursor++
-			// headers array count
-			cursor++
+
+			// removingReplicas compact array (skip)
+			removingLen := int(content[cursor]) - 1
+			cursor += 1 + removingLen*4
+
+			// addingReplicas compact array (skip)
+			addingLen := int(content[cursor]) - 1
+			cursor += 1 + addingLen*4
+
+			partition.LeaderID = int32(content[cursor])<<24 | int32(content[cursor+1])<<16 | int32(content[cursor+2])<<8 | int32(content[cursor+3])
+			cursor += 4
+			partition.LeaderEpoch = int32(content[cursor])<<24 | int32(content[cursor+1])<<16 | int32(content[cursor+2])<<8 | int32(content[cursor+3])
+			cursor += 4
 
 			m[topicUUID] = LogMetadata{
 				Name:       m[topicUUID].Name,
 				Partitions: append(m[topicUUID].Partitions, partition),
 			}
+			// default: unknown record type (BrokerRecord, FeatureLevelRecord, etc.) — just skip
 		}
+
+		// reliably advance to the next record using valueLen, regardless of how much of the
+		// value we actually parsed above. +1 skips the headersCount varint (always 0x00 here).
+		cursor = valueStart + valueLen + 1
 	}
 
-	return
+	return m
 }
 
 func (resp *Response) LoadClusterMetadata() error {
