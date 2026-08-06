@@ -8,6 +8,7 @@ const (
 	ErrNone                    int16 = 0
 	ErrUnsupportedVersion      int16 = 35
 	UNKNOWN_TOPIC_OR_PARTITION int16 = 3
+	UNKNOWN_TOPIC_ID           int16 = 100
 
 	BrokerRecord          = 0x00
 	TopicRecordWait       = 0x01
@@ -30,6 +31,7 @@ type Request struct {
 	MsgSize int32
 	RequestHeader
 	RequestBody
+	FetchTopics []FetchTopic // populated for FETCH requests
 }
 
 type Response struct {
@@ -44,6 +46,7 @@ type Response struct {
 	NextCursor     byte  // cursor for pagination
 	ThrottleTimeMS int32 // throttle time in milliseconds
 	TagBuffer      byte  //optional tagged fields just as RequestHeader.OptionalTags
+	FetchTopics    []FetchTopic // populated for FETCH responses
 }
 
 type APIKey struct {
@@ -94,4 +97,36 @@ type Partition struct {
 type LogMetadata struct {
 	Name       string
 	Partitions []Partition
+}
+
+// Fetch
+
+type FetchRequestBody struct {
+	MaxWaitMs           int32
+	MinBytes            int32
+	MaxBytes            int32
+	IsolationLevel      int8
+	SessionID           int32
+	SessionEpoch        int32
+	Topics              []FetchTopic
+	ForgottenTopicsData []ForgottenTopicData
+	RackId              string
+}
+
+type ForgottenTopicData struct {
+	TopicId    []byte
+	Partitions []int32
+}
+type FetchTopic struct {
+	TopicId    [16]byte
+	Partitions []FetchPartition
+}
+
+type FetchPartition struct {
+	Partition          int32
+	CurrentLeaderEpoch int32
+	FetchOffset        int64
+	LastFetchedEpoch   int32
+	LogStartOffset     int64
+	PartitionMaxBytes  int32
 }

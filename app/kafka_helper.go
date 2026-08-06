@@ -40,7 +40,7 @@ func (resp *Response) Init(req *Request) {
 		resp.LoadClusterMetadata() // load cluster metadata from the log file
 
 	case FETCH:
-		resp.ConstructResponseForFetch()
+		resp.FetchTopics = req.FetchTopics
 
 	default:
 		resp.ErrorCode = ErrUnsupportedVersion
@@ -53,28 +53,39 @@ func (resp *Response) Init(req *Request) {
 func (resp *Response) ConstructResponseForFetch() []byte {
 	/* ====== response header v1 ====== */
 	res := []byte{
-		// correlation_id (4 bytes)
 		byte(resp.CorrelationID >> 24), byte(resp.CorrelationID >> 16),
 		byte(resp.CorrelationID >> 8), byte(resp.CorrelationID),
 		0x00, // TAG_BUFFER
 	}
 
 	/* ============= body ============= */
-	// throttle_time_ms (4 bytes)
-	res = append(res, 0x00, 0x00, 0x00, 0x00)
+	res = append(res, 0x00, 0x00, 0x00, 0x00) // throttle_time_ms (4 bytes)
+	res = append(res, 0x00, 0x00)             // error_code (2 bytes)
+	res = append(res, 0x00, 0x00, 0x00, 0x00) // session_id (4 bytes)
 
-	// error_code (2 bytes)
-	res = append(res, 0x00, 0x00)
+	// responses compact array (N+1)
+	res = append(res, byte(len(resp.FetchTopics)+1))
+	for _, topic := range resp.FetchTopics {
+		// topic_id (16 bytes UUID)
+		res = append(res, topic.TopicId[:]...)
 
-	// session_id (4 bytes)
-	res = append(res, 0x00, 0x00, 0x00, 0x00)
+		// partitions compact array (N+1)
+		res = append(res, byte(len(topic.Partitions)+1))
+		for _, p := range topic.Partitions {
+			res = append(res, byte(p.Partition>>24), byte(p.Partition>>16), byte(p.Partition>>8), byte(p.Partition)) // partition_index
+			res = append(res, byte(UNKNOWN_TOPIC_ID>>8), byte(UNKNOWN_TOPIC_ID))                                    // error_code = 100
+			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)                                      // high_watermark (8 bytes)
+			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)                                      // last_stable_offset (8 bytes)
+			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)                                      // log_start_offset (8 bytes)
+			res = append(res, 0x01)                                                                                  // aborted_transactions: empty compact array
+			res = append(res, 0xff, 0xff, 0xff, 0xff)                                                               // preferred_read_replica: -1
+			res = append(res, 0x01)                                                                                  // records: empty compact bytes
+			res = append(res, 0x00)                                                                                  // TAG_BUFFER
+		}
+		res = append(res, 0x00) // TAG_BUFFER per topic
+	}
 
-	// responses compact array: 0 elements (stored as 0+1 = 1)
-	res = append(res, 0x01)
-
-	// TAG_BUFFER
-	res = append(res, 0x00)
-
+	res = append(res, 0x00) // body TAG_BUFFER
 	return res
 }
 
@@ -128,6 +139,39 @@ func RecieveRequest(conn net.Conn) (*Request, error) {
 		}
 	}
 
+	if api_key == FETCH {
+		// Fetch Request (Version: 16)
+		// skip: max_wait_ms(4) + min_bytes(4) + max_bytes(4) + isolation_level(1) + session_id(4) + session_epoch(4) = 21 bytes
+		cursor += 21
+
+		numTopics := int(buf[cursor]) - 1 // compact array
+		cursor++
+
+		fetchTopics := make([]FetchTopic, 0, numTopics)
+		for range numTopics {
+			var topicId [16]byte
+			copy(topicId[:], buf[cursor:cursor+16])
+			cursor += 16
+
+			numPartitions := int(buf[cursor]) - 1 // compact array
+			cursor++
+
+			partitions := make([]FetchPartition, 0, numPartitions)
+			for range numPartitions {
+				partitionIndex := int32(buf[cursor])<<24 | int32(buf[cursor+1])<<16 | int32(buf[cursor+2])<<8 | int32(buf[cursor+3])
+				cursor += 4
+				// skip: current_leader_epoch(4) + fetch_offset(8) + last_fetched_epoch(4) + log_start_offset(8) + partition_max_bytes(4) = 28 bytes
+				cursor += 28
+				cursor++ // TAG_BUFFER per partition
+				partitions = append(partitions, FetchPartition{Partition: partitionIndex})
+			}
+			cursor++ // TAG_BUFFER per topic
+
+			fetchTopics = append(fetchTopics, FetchTopic{TopicId: topicId, Partitions: partitions})
+		}
+		req.FetchTopics = fetchTopics
+	}
+
 	return req, nil
 }
 
@@ -140,6 +184,8 @@ func (resp *Response) SendResp(conn net.Conn, req *Request) error {
 		res = resp.ConstructResponseForApiVersions()
 	case DESCRIBE_TOPIC_PARTITIONS:
 		res = resp.ConstructResponseForDescribeTopic()
+	case FETCH:
+		res = resp.ConstructResponseForFetch()
 	}
 
 	msgSize := int32(len(res))
