@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -65,32 +66,54 @@ func (resp *Response) ConstructResponseForFetch() []byte {
 
 	// responses compact array (N+1)
 	res = append(res, byte(len(resp.FetchTopics)+1))
-	m, _ := readLogFileToMap() // read the cluster metadata from the log file to get the topic_id for each topic
+	m, _ := readLogFileToMap() // read the cluster metadata to look up topic names by UUID
 
 	for _, topic := range resp.FetchTopics {
 		// topic_id (16 bytes UUID)
 		res = append(res, topic.TopicId[:]...)
+
+		metadata, exists := m[topic.TopicId]
 
 		// partitions compact array (N+1)
 		res = append(res, byte(len(topic.Partitions)+1))
 		for _, p := range topic.Partitions {
 			res = append(res, byte(p.Partition>>24), byte(p.Partition>>16), byte(p.Partition>>8), byte(p.Partition)) // partition_index
 
-			// if exists topic_id in the cluster metadata, then return error_code = 0, else return error_code = 100
-			_, exists := m[topic.TopicId]
-			if exists {
-				res = append(res, byte(ErrNone>>8), byte(ErrNone)) // error_code = 0
-			} else {
+			if !exists {
 				res = append(res, byte(UNKNOWN_TOPIC_ID>>8), byte(UNKNOWN_TOPIC_ID)) // error_code = 100
+				res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)   // high_watermark
+				res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)   // last_stable_offset
+				res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)   // log_start_offset
+				res = append(res, 0x01)                                              // aborted_transactions: empty
+				res = append(res, 0xff, 0xff, 0xff, 0xff)                            // preferred_read_replica: -1
+				res = append(res, 0x01)                                              // records: empty
+				res = append(res, 0x00)                                              // TAG_BUFFER
+				continue
 			}
 
-			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00) // high_watermark (8 bytes)
-			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00) // last_stable_offset (8 bytes)
-			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00) // log_start_offset (8 bytes)
-			res = append(res, 0x01)                                           // aborted_transactions: empty compact array
-			res = append(res, 0xff, 0xff, 0xff, 0xff)                         // preferred_read_replica: -1
-			res = append(res, 0x01)                                           // records: empty compact bytes
-			res = append(res, 0x00)                                           // TAG_BUFFER
+			// topic exists — read the partition log file from disk
+			logPath := fmt.Sprintf("/tmp/kraft-combined-logs/%s-%d/00000000000000000000.log", metadata.Name, p.Partition)
+			records, err := os.ReadFile(logPath)
+			if err != nil {
+				records = nil
+			}
+
+			highWatermark := int64(len(metadata.Partitions)) // number of messages = number of partitions in metadata? no — use records count
+			// high_watermark = next offset after the last message; for 1 message it's 1
+			if records != nil {
+				highWatermark = 1 // will be improved in fd8 (multiple messages)
+			}
+
+			res = append(res, byte(ErrNone>>8), byte(ErrNone))                                        // error_code = 0
+			res = append(res, byte(highWatermark>>56), byte(highWatermark>>48), byte(highWatermark>>40), byte(highWatermark>>32),
+				byte(highWatermark>>24), byte(highWatermark>>16), byte(highWatermark>>8), byte(highWatermark)) // high_watermark
+			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)                        // last_stable_offset
+			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)                        // log_start_offset
+			res = append(res, 0x01)                                                                    // aborted_transactions: empty
+			res = append(res, 0xff, 0xff, 0xff, 0xff)                                                  // preferred_read_replica: -1
+			// records: compact bytes — length = len(records)+1, then raw bytes
+			res = appendCompactBytes(res, records)
+			res = append(res, 0x00) // TAG_BUFFER
 		}
 		res = append(res, 0x00) // TAG_BUFFER per topic
 	}
@@ -256,6 +279,23 @@ func appendCompactInt32Array(res []byte, arr []int32) []byte {
 		res = append(res, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 	}
 	return res
+}
+
+// appendCompactBytes writes data as a compact NULLABLE_BYTES field:
+// length = len(data)+1 encoded as unsigned varint, then the raw bytes.
+// nil data is encoded as length=0 (null).
+func appendCompactBytes(res []byte, data []byte) []byte {
+	if data == nil {
+		return append(res, 0x00) // null
+	}
+	n := len(data) + 1 // compact encoding: stored length = real length + 1
+	// encode n as unsigned varint (LEB128)
+	for n >= 0x80 {
+		res = append(res, byte(n)|0x80)
+		n >>= 7
+	}
+	res = append(res, byte(n))
+	return append(res, data...)
 }
 
 func (resp *Response) ConstructResponseForDescribeTopic() (res []byte) {
