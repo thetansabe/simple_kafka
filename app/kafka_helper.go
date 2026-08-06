@@ -65,6 +65,8 @@ func (resp *Response) ConstructResponseForFetch() []byte {
 
 	// responses compact array (N+1)
 	res = append(res, byte(len(resp.FetchTopics)+1))
+	m, _ := readLogFileToMap() // read the cluster metadata from the log file to get the topic_id for each topic
+
 	for _, topic := range resp.FetchTopics {
 		// topic_id (16 bytes UUID)
 		res = append(res, topic.TopicId[:]...)
@@ -73,14 +75,22 @@ func (resp *Response) ConstructResponseForFetch() []byte {
 		res = append(res, byte(len(topic.Partitions)+1))
 		for _, p := range topic.Partitions {
 			res = append(res, byte(p.Partition>>24), byte(p.Partition>>16), byte(p.Partition>>8), byte(p.Partition)) // partition_index
-			res = append(res, byte(UNKNOWN_TOPIC_ID>>8), byte(UNKNOWN_TOPIC_ID))                                    // error_code = 100
-			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)                                      // high_watermark (8 bytes)
-			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)                                      // last_stable_offset (8 bytes)
-			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)                                      // log_start_offset (8 bytes)
-			res = append(res, 0x01)                                                                                  // aborted_transactions: empty compact array
-			res = append(res, 0xff, 0xff, 0xff, 0xff)                                                               // preferred_read_replica: -1
-			res = append(res, 0x01)                                                                                  // records: empty compact bytes
-			res = append(res, 0x00)                                                                                  // TAG_BUFFER
+
+			// if exists topic_id in the cluster metadata, then return error_code = 0, else return error_code = 100
+			_, exists := m[topic.TopicId]
+			if exists {
+				res = append(res, byte(ErrNone>>8), byte(ErrNone)) // error_code = 0
+			} else {
+				res = append(res, byte(UNKNOWN_TOPIC_ID>>8), byte(UNKNOWN_TOPIC_ID)) // error_code = 100
+			}
+
+			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00) // high_watermark (8 bytes)
+			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00) // last_stable_offset (8 bytes)
+			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00) // log_start_offset (8 bytes)
+			res = append(res, 0x01)                                           // aborted_transactions: empty compact array
+			res = append(res, 0xff, 0xff, 0xff, 0xff)                         // preferred_read_replica: -1
+			res = append(res, 0x01)                                           // records: empty compact bytes
+			res = append(res, 0x00)                                           // TAG_BUFFER
 		}
 		res = append(res, 0x00) // TAG_BUFFER per topic
 	}
@@ -140,7 +150,7 @@ func RecieveRequest(conn net.Conn) (*Request, error) {
 	}
 
 	if api_key == FETCH {
-		// Fetch Request (Version: 16)
+		// Fetch Request (Version: 16) - https://kafka.apache.org/42/design/protocol/#The_Messages_Fetch
 		// skip: max_wait_ms(4) + min_bytes(4) + max_bytes(4) + isolation_level(1) + session_id(4) + session_epoch(4) = 21 bytes
 		cursor += 21
 
@@ -434,16 +444,7 @@ func parseBatchRecords(content []byte, batchStart, batchEnd int, m map[[16]byte]
 }
 
 func (resp *Response) LoadClusterMetadata() error {
-	content, err := os.ReadFile("/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log")
-	if err != nil {
-		return err
-	}
-
-	log.Println("Will ParseClusterMetadataLog fail?")
-
-	m := LogMetadataMapByUuid(content)
-
-	log.Println("ParseClusterMetadataLog didn't fail")
+	m, _ := readLogFileToMap()
 
 	for i := range resp.Topics {
 		for uuid, metadata := range m {
@@ -462,4 +463,19 @@ func (resp *Response) LoadClusterMetadata() error {
 	}
 
 	return nil
+}
+
+func readLogFileToMap() (map[[16]byte]LogMetadata, error) {
+	content, err := os.ReadFile("/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log")
+	if err != nil {
+		return nil, err
+	}
+
+	log.Println("Will ParseClusterMetadataLog fail?")
+
+	m := LogMetadataMapByUuid(content)
+
+	log.Println("ParseClusterMetadataLog didn't fail")
+
+	return m, nil
 }

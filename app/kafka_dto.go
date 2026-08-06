@@ -101,18 +101,6 @@ type LogMetadata struct {
 
 // Fetch
 
-type FetchRequestBody struct {
-	MaxWaitMs           int32
-	MinBytes            int32
-	MaxBytes            int32
-	IsolationLevel      int8
-	SessionID           int32
-	SessionEpoch        int32
-	Topics              []FetchTopic
-	ForgottenTopicsData []ForgottenTopicData
-	RackId              string
-}
-
 type ForgottenTopicData struct {
 	TopicId    []byte
 	Partitions []int32
