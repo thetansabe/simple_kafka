@@ -18,9 +18,11 @@ func (resp *Response) Init(req *Request) {
 		}
 		resp.APIKeys = []APIKey{
 			// ApiVersions
-			{APIKey: 18, MinVersion: 0, MaxVersion: 4, TagBuffer: 0},
+			{APIKey: APIKeyApiVersions, MinVersion: 0, MaxVersion: 4, TagBuffer: 0},
 			// DescribeTopicPartitions
-			{APIKey: 75, MinVersion: 0, MaxVersion: 0, TagBuffer: 0},
+			{APIKey: DESCRIBE_TOPIC_PARTITIONS, MinVersion: 0, MaxVersion: 0, TagBuffer: 0},
+			// Fetch
+			{APIKey: FETCH, MinVersion: 0, MaxVersion: 16, TagBuffer: 0},
 		}
 
 	case DESCRIBE_TOPIC_PARTITIONS:
@@ -37,9 +39,43 @@ func (resp *Response) Init(req *Request) {
 		resp.NextCursor = 0xff     // null cursor
 		resp.LoadClusterMetadata() // load cluster metadata from the log file
 
+	case FETCH:
+		resp.ConstructResponseForFetch()
+
 	default:
 		resp.ErrorCode = ErrUnsupportedVersion
 	}
+}
+
+// https://kafka.apache.org/43/design/protocol/
+// search for Fetch Response (Version: 16) - that's the body
+// search for Response Header v1 - that's the header
+func (resp *Response) ConstructResponseForFetch() []byte {
+	/* ====== response header v1 ====== */
+	res := []byte{
+		// correlation_id (4 bytes)
+		byte(resp.CorrelationID >> 24), byte(resp.CorrelationID >> 16),
+		byte(resp.CorrelationID >> 8), byte(resp.CorrelationID),
+		0x00, // TAG_BUFFER
+	}
+
+	/* ============= body ============= */
+	// throttle_time_ms (4 bytes)
+	res = append(res, 0x00, 0x00, 0x00, 0x00)
+
+	// error_code (2 bytes)
+	res = append(res, 0x00, 0x00)
+
+	// session_id (4 bytes)
+	res = append(res, 0x00, 0x00, 0x00, 0x00)
+
+	// responses compact array: 0 elements (stored as 0+1 = 1)
+	res = append(res, 0x01)
+
+	// TAG_BUFFER
+	res = append(res, 0x00)
+
+	return res
 }
 
 func RecieveRequest(conn net.Conn) (*Request, error) {

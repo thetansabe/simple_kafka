@@ -3,6 +3,7 @@ package main
 const (
 	APIKeyApiVersions         int16 = 18
 	DESCRIBE_TOPIC_PARTITIONS int16 = 75
+	FETCH                     int16 = 1
 
 	ErrNone                    int16 = 0
 	ErrUnsupportedVersion      int16 = 35
