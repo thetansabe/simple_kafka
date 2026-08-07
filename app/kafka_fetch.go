@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
 )
@@ -74,23 +73,30 @@ func (resp *Response) ConstructResponseForFetch() []byte {
 			// highWatermark = last batch's baseOffset + recordsCount.
 			highWatermark := int64(0)
 			recordsToSend := []byte{}
-			for pos := 0; pos+12 <= len(records); {
-				baseOff := int64(binary.BigEndian.Uint64(records[pos : pos+8]))
-				batchLen := int(binary.BigEndian.Uint32(records[pos+8 : pos+12]))
-				batchEnd := pos + 12 + batchLen
+			batchR := newReader(records)
+			for batchR.Len() >= 12 {
+				batchStart := len(records) - batchR.Len()
+				baseOff := batchR.ReadInt64()
+				batchLen := int(batchR.ReadInt32())
+				batchEnd := batchStart + 12 + batchLen
 				if batchEnd > len(records) {
 					break
 				}
-				if pos+61 <= len(records) {
-					recordsCount := int64(binary.BigEndian.Uint32(records[pos+57 : pos+61]))
+				batchBody := newReader(batchR.ReadBytes(batchLen))
+
+				if batchBody.Len() >= 49 {
+					// recordsCount is at offset 45 in batchBody:
+					// partitionLeaderEpoch(4)+magic(1)+crc(4)+attributes(2)+lastOffsetDelta(4)+
+					// firstTimestamp(8)+maxTimestamp(8)+producerId(8)+producerEpoch(2)+baseSequence(4) = 45 bytes
+					batchBody.Skip(45)
+					recordsCount := int64(batchBody.ReadInt32())
 					highWatermark = baseOff + recordsCount
 					// include this batch only if it contains offsets >= fetch_offset
 					lastOffsetInBatch := baseOff + recordsCount - 1
 					if lastOffsetInBatch >= p.FetchOffset {
-						recordsToSend = append(recordsToSend, records[pos:batchEnd]...)
+						recordsToSend = append(recordsToSend, records[batchStart:batchEnd]...)
 					}
 				}
-				pos = batchEnd
 			}
 
 			res = appendInt16(res, ErrNone)       // error_code = 0

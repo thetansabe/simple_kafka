@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"log"
 	"os"
 )
@@ -122,112 +121,97 @@ func readLogFileToMap() (map[[16]byte]LogMetadata, error) {
 func LogMetadataMapByUuid(content []byte) map[[16]byte]LogMetadata {
 	m := make(map[[16]byte]LogMetadata)
 
+	r := newReader(content)
 	// skip batch 1 (only contains FeatureLevel/Broker records, no topic/partition data)
-	batch1Len := int(binary.BigEndian.Uint32(content[8:12]))
-	batchStart := 12 + batch1Len
+	r.Skip(8)                       // baseOffset of batch 1
+	batch1Len := int(r.ReadInt32()) // batchLength field counts bytes after this point
+	r.Skip(batch1Len)               // skip rest of batch 1
 
 	// now the log file contains many batches, each containing a topic record and one or more partition records
 	// we need to read all batches
-	for batchStart+12 <= len(content) {
-		batchLen := int(binary.BigEndian.Uint32(content[batchStart+8 : batchStart+12]))
-		batchEnd := batchStart + 12 + batchLen
-		if batchEnd > len(content) {
+	for r.Len() >= 12 {
+		r.Skip(8)                      // baseOffset
+		batchLen := int(r.ReadInt32()) // batchLength
+		if r.Len() < batchLen {
 			break
 		}
-		parseBatchRecords(content, batchStart, batchEnd, m)
-		batchStart = batchEnd
+		// batchLen bytes: 49-byte remaining RecordBatch header + all records
+		batchBody := newReader(r.ReadBytes(batchLen))
+		parseBatchRecords(batchBody, m)
 	}
 
 	return m
 }
 
-// parseBatchRecords reads all records in one RecordBatch and populates the map.
-// batchStart points to the start of the batch (baseOffset field).
-// batchEnd  points to the first byte AFTER this batch.
-func parseBatchRecords(content []byte, batchStart, batchEnd int, m map[[16]byte]LogMetadata) {
-	// skip the 61-byte RecordBatch header (8+4+4+1+4+2+4+8+8+8+2+4+4 = 61 bytes)
-	cursor := batchStart + 61
+// parseBatchRecords reads all records in one RecordBatch body and populates the map.
+// r starts at the first byte after the 12-byte framing (baseOffset + batchLength).
+func parseBatchRecords(r *Reader, m map[[16]byte]LogMetadata) {
+	// skip the remaining 49 bytes of RecordBatch header
+	// (61 total header - 12 framing already consumed = 49 left)
+	r.Skip(49)
 
-	for cursor < batchEnd {
-		// Record length is a varint (LEB128): bit 7 = 1 means "one more byte follows"
-		if (content[cursor]>>7)&1 == 1 {
-			cursor++ // skip first byte of 2-byte varint
-		}
-		cursor++ // advance past last (or only) byte of record length
+	for r.Len() > 0 {
+		// Record length: LEB128 unsigned varint (discarded — boundary is driven by value_length below)
+		r.ReadUvarint()
 
 		// skip: attributes(1) + timestampDelta(1) + offsetDelta(1) + keyLength(1) + key(0, null)
-		cursor += 4
+		r.Skip(4)
 
-		// value_length is a signed zigzag varint (stored as 2*n, decode with >>1)
-		var valueLen int
-		switch (content[cursor] >> 7) & 1 {
-		case 0:
-			valueLen = int(content[cursor]) >> 1
-		case 1:
-			valueLen = ((int(content[cursor]) & 0x7F) | ((int(content[cursor+1]) & 0x7F) << 7)) >> 1
-			cursor++ // cursor now on last byte of 2-byte varint
-		}
+		// value_length: zigzag-encoded signed varint (stored as 2*n, decode with >>1)
+		valueLen := r.ReadZigzag()
 
-		// cursor+1 = frame_version, cursor+2 = type, cursor+3 = version
-		valueStart := cursor + 1
+		// consume exactly valueLen bytes as a sub-reader so parsing can't overrun the record boundary
+		value := newReader(r.ReadBytes(valueLen))
+		r.Skip(1) // headersCount varint (always 0x00)
 
-		switch content[cursor+2] {
+		// inside value: frame_version(1) + type(1) + version(1) + type-specific data
+		value.Skip(1) // frame_version
+		recordType := value.ReadByte()
+		value.Skip(1) // version
+
+		switch recordType {
 		case TopicRecord:
-			cursor += 4                         // skip: value_length last byte + frame_version + type + version
-			nameLen := int(content[cursor]) - 1 // compact string: stored len = real len + 1
-			cursor++
-			topicName := string(content[cursor : cursor+nameLen])
-			cursor += nameLen
-			var uuid [16]byte
-			copy(uuid[:], content[cursor:cursor+16])
+			topicName := value.ReadCompactString()
+			uuid := value.ReadUUID()
 			m[uuid] = LogMetadata{Name: topicName, Partitions: m[uuid].Partitions}
 
 		case PartitionRecord:
-			cursor += 4 // skip: value_length last byte + frame_version + type + version
-			partition := Partition{
-				PartitionIndex: int32(binary.BigEndian.Uint32(content[cursor : cursor+4])),
-			}
-			cursor += 4
+			partIdx := value.ReadInt32()
+			topicUUID := value.ReadUUID()
 
-			var topicUUID [16]byte
-			copy(topicUUID[:], content[cursor:cursor+16])
-			cursor += 16
-
-			replicaLen := int(content[cursor]) - 1
-			cursor++
-			for range replicaLen {
-				partition.ReplicaNodes = append(partition.ReplicaNodes, int32(binary.BigEndian.Uint32(content[cursor:cursor+4])))
-				cursor += 4
+			replicaLen := value.ReadUvarint() - 1
+			replicas := make([]int32, replicaLen)
+			for i := range replicaLen {
+				replicas[i] = value.ReadInt32()
 			}
 
-			isrLen := int(content[cursor]) - 1
-			cursor++
-			for range isrLen {
-				partition.IsrNodes = append(partition.IsrNodes, int32(binary.BigEndian.Uint32(content[cursor:cursor+4])))
-				cursor += 4
+			isrLen := value.ReadUvarint() - 1
+			isrs := make([]int32, isrLen)
+			for i := range isrLen {
+				isrs[i] = value.ReadInt32()
 			}
 
-			removingLen := int(content[cursor]) - 1
-			cursor += 1 + removingLen*4
+			removingLen := value.ReadUvarint() - 1
+			value.Skip(removingLen * 4)
 
-			addingLen := int(content[cursor]) - 1
-			cursor += 1 + addingLen*4
+			addingLen := value.ReadUvarint() - 1
+			value.Skip(addingLen * 4)
 
-			partition.LeaderID = int32(binary.BigEndian.Uint32(content[cursor : cursor+4]))
-			cursor += 4
-			partition.LeaderEpoch = int32(binary.BigEndian.Uint32(content[cursor : cursor+4]))
-			cursor += 4
+			leaderID := value.ReadInt32()
+			leaderEpoch := value.ReadInt32()
 
 			m[topicUUID] = LogMetadata{
-				Name:       m[topicUUID].Name,
-				Partitions: append(m[topicUUID].Partitions, partition),
+				Name: m[topicUUID].Name,
+				Partitions: append(m[topicUUID].Partitions, Partition{
+					PartitionIndex: partIdx,
+					ReplicaNodes:   replicas,
+					IsrNodes:       isrs,
+					LeaderID:       leaderID,
+					LeaderEpoch:    leaderEpoch,
+				}),
 			}
-			// default: unknown type (BrokerRecord, FeatureLevelRecord, etc.) — skip via valueLen below
+			// default: unknown type (BrokerRecord, FeatureLevelRecord, etc.) — value already consumed above
 		}
-
-		// always jump to the start of the next record, regardless of how much we parsed above
-		// +1 skips the headersCount varint (always 0x00)
-		cursor = valueStart + valueLen + 1
 	}
 }
 

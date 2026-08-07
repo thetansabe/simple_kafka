@@ -61,15 +61,18 @@ func RecieveRequest(conn net.Conn) (*Request, error) {
 		return nil, err
 	}
 
-	msg_size := int32(binary.BigEndian.Uint32(buf[0:4]))
-	api_key := int16(binary.BigEndian.Uint16(buf[4:6]))
-	api_version := int16(binary.BigEndian.Uint16(buf[6:8]))
-	correlation_id := int32(binary.BigEndian.Uint32(buf[8:12]))
+	r := newReader(buf)
+
+	msg_size := r.ReadInt32()
+	api_key := r.ReadInt16()
+	api_version := r.ReadInt16()
+	correlation_id := r.ReadInt32()
 
 	// parse past client_id (2-byte length prefix) and header tag_buffer
 	// buf[12..13] = client_id length, buf[14..14+len] = client_id, then 1 byte tag_buffer
-	clientIDLen := int(int16(binary.BigEndian.Uint16(buf[12:14])))
-	cursor := 14 + clientIDLen + 1 // skip client_id bytes + tag_buffer
+	clientIDLen := int(r.ReadInt16())
+	r.Skip(clientIDLen) // skip client_id bytes
+	r.Skip(1)           // skip tag_buffer
 
 	req := &Request{
 		MsgSize: msg_size,
@@ -83,58 +86,48 @@ func RecieveRequest(conn net.Conn) (*Request, error) {
 	// parse body for DescribeTopicPartitions
 	if api_key == DESCRIBE_TOPIC_PARTITIONS {
 		// compact array: length is N+1 encoded
-		numTopics := int(buf[cursor]) - 1
-		cursor++
+		numTopics := r.ReadUvarint() - 1
 
 		topics := make([]Topic, 0, numTopics)
 		for range numTopics {
 			// compact string: length is N+1 encoded
-			nameLen := int(buf[cursor]) - 1
-			cursor++
-			name := string(buf[cursor : cursor+nameLen])
-			cursor += nameLen
-			cursor++ // tag_buffer for each topic entry
+			name := r.ReadCompactString()
+			r.Skip(1) // tag_buffer for each topic entry
 			topics = append(topics, Topic{TopicName: name})
 		}
 
 		req.RequestBody = RequestBody{
 			Topics:           topics,
-			RespPartitionLim: int32(binary.BigEndian.Uint32(buf[cursor : cursor+4])),
-			Cursor:           buf[cursor+4],
+			RespPartitionLim: r.ReadInt32(),
+			Cursor:           r.ReadByte(),
 		}
 	}
 
 	if api_key == FETCH {
 		// Fetch Request (Version: 16) - https://kafka.apache.org/42/design/protocol/#The_Messages_Fetch
 		// skip: max_wait_ms(4) + min_bytes(4) + max_bytes(4) + isolation_level(1) + session_id(4) + session_epoch(4) = 21 bytes
-		cursor += 21
+		r.Skip(21)
 
-		numTopics := int(buf[cursor]) - 1 // compact array
-		cursor++
+		numTopics := r.ReadUvarint() - 1 // compact array
 
 		fetchTopics := make([]FetchTopic, 0, numTopics)
 		for range numTopics {
-			var topicId [16]byte
-			copy(topicId[:], buf[cursor:cursor+16])
-			cursor += 16
+			topicId := r.ReadUUID()
 
-			numPartitions := int(buf[cursor]) - 1 // compact array
-			cursor++
+			numPartitions := r.ReadUvarint() - 1 // compact array
 
 			partitions := make([]FetchPartition, 0, numPartitions)
 			for range numPartitions {
-				partitionIndex := int32(binary.BigEndian.Uint32(buf[cursor : cursor+4]))
-				cursor += 4
-				cursor += 4 // current_leader_epoch (int32)
-				fetchOffset := int64(binary.BigEndian.Uint64(buf[cursor : cursor+8]))
-				cursor += 8
-				cursor += 4 // last_fetched_epoch (int32)
-				cursor += 8 // log_start_offset (int64)
-				cursor += 4 // partition_max_bytes (int32)
-				cursor++    // TAG_BUFFER per partition
+				partitionIndex := r.ReadInt32()
+				r.Skip(4)                    // current_leader_epoch (int32)
+				fetchOffset := r.ReadInt64()
+				r.Skip(4)                    // last_fetched_epoch (int32)
+				r.Skip(8)                    // log_start_offset (int64)
+				r.Skip(4)                    // partition_max_bytes (int32)
+				r.Skip(1)                    // TAG_BUFFER per partition
 				partitions = append(partitions, FetchPartition{Partition: partitionIndex, FetchOffset: fetchOffset})
 			}
-			cursor++ // TAG_BUFFER per topic
+			r.Skip(1) // TAG_BUFFER per topic
 
 			fetchTopics = append(fetchTopics, FetchTopic{TopicId: topicId, Partitions: partitions})
 		}
@@ -144,45 +137,36 @@ func RecieveRequest(conn net.Conn) (*Request, error) {
 	if api_key == PRODUCE {
 		// Produce Request (Version: 11)
 		// transactional_id: compact nullable string (null = varint 0)
-		transactionalIdLen := int(buf[cursor]) - 1
-		cursor++
+		transactionalIdLen := r.ReadUvarint() - 1
 		if transactionalIdLen > 0 {
-			cursor += transactionalIdLen
+			r.Skip(transactionalIdLen)
 		}
-		cursor += 2 // acks (int16)
-		cursor += 4 // timeout_ms (int32)
+		r.Skip(2) // acks (int16)
+		r.Skip(4) // timeout_ms (int32)
 
-		numTopics := int(buf[cursor]) - 1 // compact array
-		cursor++
+		numTopics := r.ReadUvarint() - 1 // compact array
 
 		produceTopics := make([]ProduceTopic, 0, numTopics)
 		for range numTopics {
-			nameLen := int(buf[cursor]) - 1
-			cursor++
-			name := string(buf[cursor : cursor+nameLen])
-			cursor += nameLen
+			name := r.ReadCompactString()
 
-			numPartitions := int(buf[cursor]) - 1 // compact array
-			cursor++
+			numPartitions := r.ReadUvarint() - 1 // compact array
 
 			partitions := make([]ProducePartition, 0, numPartitions)
 			for range numPartitions {
-				partIdx := int32(binary.BigEndian.Uint32(buf[cursor : cursor+4]))
-				cursor += 4
+				partIdx := r.ReadInt32()
 				// records: compact bytes — LEB128(actualLen+1) then actualLen raw bytes
-				recordsCompactLen, newCursor := readUvarint(buf, cursor)
-				cursor = newCursor
+				actualLen := r.ReadUvarint() - 1
 				var recordBytes []byte
-				actualLen := recordsCompactLen - 1
 				if actualLen > 0 {
+					// copy since buf is the connection buffer and may be reused
 					recordBytes = make([]byte, actualLen)
-					copy(recordBytes, buf[cursor:cursor+actualLen])
-					cursor += actualLen
+					copy(recordBytes, r.ReadBytes(actualLen))
 				}
-				cursor++ // TAG_BUFFER per partition
+				r.Skip(1) // TAG_BUFFER per partition
 				partitions = append(partitions, ProducePartition{Index: partIdx, Records: recordBytes})
 			}
-			cursor++ // TAG_BUFFER per topic
+			r.Skip(1) // TAG_BUFFER per topic
 
 			produceTopics = append(produceTopics, ProduceTopic{TopicName: name, Partitions: partitions})
 		}
