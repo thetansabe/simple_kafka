@@ -173,8 +173,6 @@ func (resp *Response) ConstructResponseForFetch() []byte {
 				records = nil
 			}
 
-			highWatermark := int64(0)
-
 			// to know how many messages are in the partition, it inside record count field
 			// https://kafka.apache.org/43/implementation/message-format/#record-batch
 			// offset 57-60: recordsCount (4 bytes) ← THIS
@@ -187,17 +185,29 @@ func (resp *Response) ConstructResponseForFetch() []byte {
 			// a partition can have many batch of messages comes at different time
 			// in replication scenario, maybe the follower node don't have all messages
 			// to know which cursor the follower already have, we need to store as highWatermark
-			if len(records) >= 61 {
-				recordsCount := int64(records[57])<<24 | int64(records[58])<<16 | int64(records[59])<<8 | int64(records[60])
-				highWatermark = recordsCount
-			} else if records != nil {
-				highWatermark = 1
+			highWatermark := int64(0)
+
+			// to read all RecordBatch we need to read the first 12 bytes of each RecordBatch to know the batch length
+			for pos := 0; pos+12 <= len(records); {
+				baseOff := int64(records[pos])<<56 | int64(records[pos+1])<<48 | int64(records[pos+2])<<40 | int64(records[pos+3])<<32 |
+					int64(records[pos+4])<<24 | int64(records[pos+5])<<16 | int64(records[pos+6])<<8 | int64(records[pos+7])
+				batchLen := int(records[pos+8])<<24 | int(records[pos+9])<<16 | int(records[pos+10])<<8 | int(records[pos+11])
+				batchEnd := pos + 12 + batchLen
+				if batchEnd > len(records) {
+					break
+				}
+				if pos+61 <= len(records) {
+					recordsCount := int64(records[pos+57])<<24 | int64(records[pos+58])<<16 | int64(records[pos+59])<<8 | int64(records[pos+60])
+					highWatermark = baseOff + recordsCount
+				}
+				pos = batchEnd
 			}
 
 			res = append(res, byte(ErrNone>>8), byte(ErrNone)) // error_code = 0
 			res = append(res, byte(highWatermark>>56), byte(highWatermark>>48), byte(highWatermark>>40), byte(highWatermark>>32),
 				byte(highWatermark>>24), byte(highWatermark>>16), byte(highWatermark>>8), byte(highWatermark)) // high_watermark
-			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00) // last_stable_offset
+			res = append(res, byte(highWatermark>>56), byte(highWatermark>>48), byte(highWatermark>>40), byte(highWatermark>>32),
+				byte(highWatermark>>24), byte(highWatermark>>16), byte(highWatermark>>8), byte(highWatermark)) // last_stable_offset = high_watermark
 			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00) // log_start_offset
 			res = append(res, 0x01)                                           // aborted_transactions: empty
 			res = append(res, 0xff, 0xff, 0xff, 0xff)                         // preferred_read_replica: -1
