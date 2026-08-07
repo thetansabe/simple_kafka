@@ -24,6 +24,8 @@ func (resp *Response) Init(req *Request) {
 			{APIKey: DESCRIBE_TOPIC_PARTITIONS, MinVersion: 0, MaxVersion: 0, TagBuffer: 0},
 			// Fetch
 			{APIKey: FETCH, MinVersion: 0, MaxVersion: 16, TagBuffer: 0},
+			// Produce
+			{APIKey: PRODUCE, MinVersion: 0, MaxVersion: 8, TagBuffer: 0},
 		}
 
 	case DESCRIBE_TOPIC_PARTITIONS:
@@ -42,10 +44,69 @@ func (resp *Response) Init(req *Request) {
 
 	case FETCH:
 		resp.FetchTopics = req.FetchTopics
-
+	case PRODUCE:
+		m, _ := readLogFileToMap()
+		for _, pt := range req.ProduceTopics {
+			t := TopicForResp{TopicName: pt.TopicName}
+			found := false
+			for _, meta := range m {
+				if meta.Name == pt.TopicName {
+					found = true
+					break
+				}
+			}
+			errCode := UNKNOWN_TOPIC_OR_PARTITION
+			if found {
+				errCode = ErrNone
+			}
+			for _, partIdx := range pt.Partitions {
+				t.Partitions = append(t.Partitions, Partition{
+					PartitionIndex: partIdx,
+					ErrCode:        errCode,
+				})
+			}
+			resp.Topics = append(resp.Topics, t)
+		}
 	default:
 		resp.ErrorCode = ErrUnsupportedVersion
 	}
+}
+
+// https://binspec.org/kafka-produce-unknown-topic-or-partition-response-v11?highlight=4-7
+func (resp *Response) ConstructResponseForProduce() []byte {
+	/* ====== response header v1 ====== */
+	res := []byte{
+		byte(resp.CorrelationID >> 24), byte(resp.CorrelationID >> 16),
+		byte(resp.CorrelationID >> 8), byte(resp.CorrelationID),
+		0x00, // TAG_BUFFER
+	}
+
+	/* ============= body ============= */
+	// responses: compact array (N+1)
+	res = append(res, byte(len(resp.Topics)+1))
+	for _, topic := range resp.Topics {
+		// name: compact string
+		res = append(res, byte(len(topic.TopicName)+1))
+		res = append(res, []byte(topic.TopicName)...)
+
+		// partition_responses: compact array (N+1)
+		res = append(res, byte(len(topic.Partitions)+1))
+		for _, p := range topic.Partitions {
+			res = append(res, byte(p.PartitionIndex>>24), byte(p.PartitionIndex>>16), byte(p.PartitionIndex>>8), byte(p.PartitionIndex)) // index (int32)
+			res = append(res, byte(p.ErrCode>>8), byte(p.ErrCode))                                                                       // error_code (int16)
+			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)                                                           // base_offset (int64)
+			res = append(res, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff)                                                            // log_append_time_ms = -1 (int64)
+			res = append(res, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff)                                                            // log_start_offset = -1 (int64)
+			res = append(res, 0x01)                                                                                                      // record_errors: empty compact array
+			res = append(res, 0x00)                                                                                                      // error_message: null compact string
+			res = append(res, 0x00)                                                                                                      // TAG_BUFFER
+		}
+		res = append(res, 0x00) // TAG_BUFFER per topic
+	}
+
+	res = append(res, byte(resp.ThrottleTimeMS>>24), byte(resp.ThrottleTimeMS>>16), byte(resp.ThrottleTimeMS>>8), byte(resp.ThrottleTimeMS)) // throttle_time_ms
+	res = append(res, 0x00)                                                                                                                  // TAG_BUFFER
+	return res
 }
 
 // https://kafka.apache.org/43/design/protocol/
@@ -220,6 +281,50 @@ func RecieveRequest(conn net.Conn) (*Request, error) {
 		req.FetchTopics = fetchTopics
 	}
 
+	if api_key == PRODUCE {
+		// Produce Request (Version: 11)
+		// transactional_id: compact nullable string (null = varint 0)
+		transactionalIdLen := int(buf[cursor]) - 1
+		cursor++
+		if transactionalIdLen > 0 {
+			cursor += transactionalIdLen
+		}
+		cursor += 2 // acks (int16)
+		cursor += 4 // timeout_ms (int32)
+
+		numTopics := int(buf[cursor]) - 1 // compact array
+		cursor++
+
+		produceTopics := make([]ProduceTopic, 0, numTopics)
+		for range numTopics {
+			nameLen := int(buf[cursor]) - 1
+			cursor++
+			name := string(buf[cursor : cursor+nameLen])
+			cursor += nameLen
+
+			numPartitions := int(buf[cursor]) - 1 // compact array
+			cursor++
+
+			partitions := make([]int32, 0, numPartitions)
+			for range numPartitions {
+				partIdx := int32(buf[cursor])<<24 | int32(buf[cursor+1])<<16 | int32(buf[cursor+2])<<8 | int32(buf[cursor+3])
+				cursor += 4
+				// skip records: compact bytes (LEB128 varint length, then raw bytes)
+				recordsLen, newCursor := readUvarint(buf, cursor)
+				cursor = newCursor
+				if recordsLen > 1 {
+					cursor += recordsLen - 1 // actual bytes = compactLen - 1
+				}
+				cursor++ // TAG_BUFFER per partition
+				partitions = append(partitions, partIdx)
+			}
+			cursor++ // TAG_BUFFER per topic
+
+			produceTopics = append(produceTopics, ProduceTopic{TopicName: name, Partitions: partitions})
+		}
+		req.ProduceTopics = produceTopics
+	}
+
 	return req, nil
 }
 
@@ -234,6 +339,8 @@ func (resp *Response) SendResp(conn net.Conn, req *Request) error {
 		res = resp.ConstructResponseForDescribeTopic()
 	case FETCH:
 		res = resp.ConstructResponseForFetch()
+	case PRODUCE:
+		res = resp.ConstructResponseForProduce()
 	}
 
 	msgSize := int32(len(res))
@@ -247,6 +354,23 @@ func (resp *Response) SendResp(conn net.Conn, req *Request) error {
 	// write the response to the connection
 	_, err := conn.Write(append(frame, res...))
 	return err
+}
+
+// readUvarint decodes a LEB128 unsigned varint from buf starting at cursor.
+// Returns (value, newCursor).
+func readUvarint(buf []byte, cursor int) (int, int) {
+	result := 0
+	shift := 0
+	for {
+		b := int(buf[cursor])
+		cursor++
+		result |= (b & 0x7F) << shift
+		if b&0x80 == 0 {
+			break
+		}
+		shift += 7
+	}
+	return result, cursor
 }
 
 func (resp *Response) ConstructResponseForApiVersions() (res []byte) {

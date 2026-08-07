@@ -3,7 +3,8 @@ package main
 const (
 	APIKeyApiVersions         int16 = 18
 	DESCRIBE_TOPIC_PARTITIONS int16 = 75
-	FETCH                     int16 = 1
+	FETCH                     int16 = 1 // consuming messages - consumer pulls (fetches) messages from the broker, not broker push to consumer
+	PRODUCE                   int16 = 0 // producing messages
 
 	ErrNone                    int16 = 0
 	ErrUnsupportedVersion      int16 = 35
@@ -31,7 +32,8 @@ type Request struct {
 	MsgSize int32
 	RequestHeader
 	RequestBody
-	FetchTopics []FetchTopic // populated for FETCH requests
+	FetchTopics   []FetchTopic   // populated for FETCH requests
+	ProduceTopics []ProduceTopic // populated for PRODUCE requests
 }
 
 type Response struct {
@@ -43,9 +45,9 @@ type Response struct {
 	ErrorCode      int16
 	APIKeys        []APIKey // compact array - list of specified struct
 	Topics         []TopicForResp
-	NextCursor     byte  // cursor for pagination
-	ThrottleTimeMS int32 // throttle time in milliseconds
-	TagBuffer      byte  //optional tagged fields just as RequestHeader.OptionalTags
+	NextCursor     byte         // cursor for pagination
+	ThrottleTimeMS int32        // throttle time in milliseconds
+	TagBuffer      byte         //optional tagged fields just as RequestHeader.OptionalTags
 	FetchTopics    []FetchTopic // populated for FETCH responses
 }
 
@@ -97,6 +99,13 @@ type Partition struct {
 type LogMetadata struct {
 	Name       string
 	Partitions []Partition
+}
+
+// Produce
+
+type ProduceTopic struct {
+	TopicName  string
+	Partitions []int32 // partition indices from the request
 }
 
 // Fetch
