@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -97,12 +98,22 @@ func (resp *Response) ConstructResponseForProduce() []byte {
 		for _, p := range topic.Partitions {
 			res = append(res, byte(p.PartitionIndex>>24), byte(p.PartitionIndex>>16), byte(p.PartitionIndex>>8), byte(p.PartitionIndex)) // index (int32)
 			res = append(res, byte(p.ErrCode>>8), byte(p.ErrCode))                                                                       // error_code (int16)
-			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)                                                            // base_offset (int64)
-			res = append(res, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff)                                                            // log_append_time_ms = -1 (int64)
-			res = append(res, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff)                                                            // log_start_offset = -1 (int64)
-			res = append(res, 0x01)                                                                                                      // record_errors: empty compact array
-			res = append(res, 0x00)                                                                                                      // error_message: null compact string
-			res = append(res, 0x00)                                                                                                      // TAG_BUFFER
+
+			if p.ErrCode != ErrNone {
+				// error case: base_offset = -1, log_start_offset = -1
+				res = append(res, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff) // base_offset = -1
+				res = append(res, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff) // log_append_time_ms = -1
+				res = append(res, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff) // log_start_offset = -1
+			} else {
+				// success case: base_offset = 0 (first record offset), log_start_offset = 0
+				res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00) // base_offset = 0
+				res = append(res, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff) // log_append_time_ms = -1
+				res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00) // log_start_offset = 0
+			}
+
+			res = append(res, 0x01) // record_errors: empty compact array
+			res = append(res, 0x00) // error_message: null compact string
+			res = append(res, 0x00) // TAG_BUFFER
 		}
 		res = append(res, 0x00) // TAG_BUFFER per topic
 	}
@@ -202,9 +213,17 @@ func (resp *Response) ConstructResponseForFetch() []byte {
 }
 
 func RecieveRequest(conn net.Conn) (*Request, error) {
-	var buf = make([]byte, 1024)
-	_, err := conn.Read(buf)
-	if err != nil {
+	// read the 4-byte message size prefix first
+	var sizeBuf [4]byte
+	if _, err := io.ReadFull(conn, sizeBuf[:]); err != nil {
+		return nil, err
+	}
+	msgSize := int(sizeBuf[0])<<24 | int(sizeBuf[1])<<16 | int(sizeBuf[2])<<8 | int(sizeBuf[3])
+
+	// allocate exact size and read the full message body
+	buf := make([]byte, msgSize+4)
+	copy(buf, sizeBuf[:])
+	if _, err := io.ReadFull(conn, buf[4:]); err != nil {
 		return nil, err
 	}
 
