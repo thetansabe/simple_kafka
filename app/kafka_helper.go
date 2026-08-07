@@ -185,9 +185,12 @@ func (resp *Response) ConstructResponseForFetch() []byte {
 			// a partition can have many batch of messages comes at different time
 			// in replication scenario, maybe the follower node don't have all messages
 			// to know which cursor the follower already have, we need to store as highWatermark
-			highWatermark := int64(0)
 
-			// to read all RecordBatch we need to read the first 12 bytes of each RecordBatch to know the batch length
+			// Walk all RecordBatches in the file.
+			// Only include batches whose last offset >= fetch_offset (p.FetchOffset).
+			// highWatermark = last batch's baseOffset + recordsCount.
+			highWatermark := int64(0)
+			recordsToSend := []byte{}
 			for pos := 0; pos+12 <= len(records); {
 				baseOff := int64(records[pos])<<56 | int64(records[pos+1])<<48 | int64(records[pos+2])<<40 | int64(records[pos+3])<<32 |
 					int64(records[pos+4])<<24 | int64(records[pos+5])<<16 | int64(records[pos+6])<<8 | int64(records[pos+7])
@@ -199,6 +202,11 @@ func (resp *Response) ConstructResponseForFetch() []byte {
 				if pos+61 <= len(records) {
 					recordsCount := int64(records[pos+57])<<24 | int64(records[pos+58])<<16 | int64(records[pos+59])<<8 | int64(records[pos+60])
 					highWatermark = baseOff + recordsCount
+					// include this batch only if it contains offsets >= fetch_offset
+					lastOffsetInBatch := baseOff + recordsCount - 1
+					if lastOffsetInBatch >= p.FetchOffset {
+						recordsToSend = append(recordsToSend, records[pos:batchEnd]...)
+					}
 				}
 				pos = batchEnd
 			}
@@ -211,8 +219,8 @@ func (resp *Response) ConstructResponseForFetch() []byte {
 			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00) // log_start_offset
 			res = append(res, 0x01)                                           // aborted_transactions: empty
 			res = append(res, 0xff, 0xff, 0xff, 0xff)                         // preferred_read_replica: -1
-			// records: compact bytes — length = len(records)+1, then raw bytes
-			res = appendCompactBytes(res, records)
+			// records: compact bytes — length = len(recordsToSend)+1, then raw bytes
+			res = appendCompactBytes(res, recordsToSend)
 			res = append(res, 0x00) // TAG_BUFFER
 		}
 		res = append(res, 0x00) // TAG_BUFFER per topic
@@ -301,10 +309,15 @@ func RecieveRequest(conn net.Conn) (*Request, error) {
 			for range numPartitions {
 				partitionIndex := int32(buf[cursor])<<24 | int32(buf[cursor+1])<<16 | int32(buf[cursor+2])<<8 | int32(buf[cursor+3])
 				cursor += 4
-				// skip: current_leader_epoch(4) + fetch_offset(8) + last_fetched_epoch(4) + log_start_offset(8) + partition_max_bytes(4) = 28 bytes
-				cursor += 28
-				cursor++ // TAG_BUFFER per partition
-				partitions = append(partitions, FetchPartition{Partition: partitionIndex})
+				cursor += 4 // current_leader_epoch (int32)
+				fetchOffset := int64(buf[cursor])<<56 | int64(buf[cursor+1])<<48 | int64(buf[cursor+2])<<40 | int64(buf[cursor+3])<<32 |
+					int64(buf[cursor+4])<<24 | int64(buf[cursor+5])<<16 | int64(buf[cursor+6])<<8 | int64(buf[cursor+7])
+				cursor += 8
+				cursor += 4 // last_fetched_epoch (int32)
+				cursor += 8 // log_start_offset (int64)
+				cursor += 4 // partition_max_bytes (int32)
+				cursor++    // TAG_BUFFER per partition
+				partitions = append(partitions, FetchPartition{Partition: partitionIndex, FetchOffset: fetchOffset})
 			}
 			cursor++ // TAG_BUFFER per topic
 
