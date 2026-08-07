@@ -103,9 +103,14 @@ type LogMetadata struct {
 
 // Produce
 
+type ProducePartition struct {
+	Index   int32
+	Records []byte // raw RecordBatch bytes from the wire
+}
+
 type ProduceTopic struct {
 	TopicName  string
-	Partitions []int32 // partition indices from the request
+	Partitions []ProducePartition
 }
 
 // Fetch

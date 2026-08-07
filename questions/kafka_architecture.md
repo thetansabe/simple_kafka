@@ -103,6 +103,78 @@ offset →  0      1      2      3      4
 
 ---
 
+### 4. RecordBatch
+
+A **RecordBatch** is a group of Records written to a partition in one Produce call. It is the unit of storage on disk.
+
+```
+Partition 0 log file (00000000000000000000.log):
+┌──────────────────────────────────┐
+│ RecordBatch 1  (written at 9am)  │
+│   baseOffset = 0                 │
+│   recordsCount = 2               │
+│   ├── Record offset=0  value=... │
+│   └── Record offset=1  value=... │
+├──────────────────────────────────┤
+│ RecordBatch 2  (written at 10am) │
+│   baseOffset = 2                 │
+│   recordsCount = 2               │
+│   ├── Record offset=2  value=... │
+│   └── Record offset=3  value=... │
+└──────────────────────────────────┘
+```
+
+RecordBatch header fields (61 bytes before the records):
+```
+baseOffset(8) + batchLength(4) + partitionLeaderEpoch(4) + magic(1) +
+crc(4) + attributes(2) + lastOffsetDelta(4) + firstTimestamp(8) +
+maxTimestamp(8) + producerId(8) + producerEpoch(2) + baseSequence(4) +
+recordsCount(4) = 61 bytes
+```
+
+---
+
+### 5. Record
+
+A **Record** is a single message inside a RecordBatch. It contains the actual payload.
+
+```
+Record fields:
+  length          (zigzag varint)  ← total size of this record
+  attributes      (1 byte)         ← always 0 currently
+  timestampDelta  (varint)         ← delta from RecordBatch.firstTimestamp
+  offsetDelta     (varint)         ← delta from RecordBatch.baseOffset
+  key             (compact bytes)  ← optional routing key
+  value           (compact bytes)  ← YOUR MESSAGE (e.g. JSON bytes)
+  headers         (compact array)  ← metadata key-value pairs
+```
+
+A Record does NOT store topic or partition — that's implicit from which file it lives in.
+
+---
+
+### Overall hierarchy
+
+```
+Topic "orders"
+  └── Partition 0  →  file: /tmp/kraft-combined-logs/orders-0/00000000000000000000.log
+  │     └── RecordBatch (baseOffset=0, count=2)
+  │     │     └── Record  offset=0  value={"traceId":"a","msg":{...}}
+  │     │     └── Record  offset=1  value={"traceId":"b","msg":{...}}
+  │     └── RecordBatch (baseOffset=2, count=1)
+  │           └── Record  offset=2  value={"traceId":"c","msg":{...}}
+  └── Partition 1  →  file: /tmp/kraft-combined-logs/orders-1/00000000000000000000.log
+        └── RecordBatch (baseOffset=0, count=1)
+              └── Record  offset=0  value={"traceId":"d","msg":{...}}
+```
+
+**From smallest to largest:**
+```
+Record < RecordBatch < Partition < Topic < Cluster
+```
+
+---
+
 ### 4. Producer
 
 Writes records to a topic. It chooses which partition via:
@@ -280,3 +352,121 @@ You're implementing the **broker** — the server that:
 2. **DescribeTopicPartitions** (key 75) — returns topic/partition metadata ← current stage
 3. **Fetch** (key 1) — returns actual message records from a partition
 4. **Produce** (key 0) — accepts and stores messages from a producer
+
+---
+
+## Message Lifecycle: Python Producer → Broker Disk → Consumer
+
+### Step 1: Python producer creates a message
+
+```python
+producer.send("orders", value={
+    "traceId": "abc123",
+    "msg": {"event": "click", "userId": 42}
+})
+```
+
+---
+
+### Step 2: Kafka client library wraps it into a RecordBatch
+
+The Python Kafka library serializes your dict (usually JSON/UTF-8 bytes) and wraps it into the official Kafka **RecordBatch** binary format before sending over TCP:
+
+```
+RecordBatch (binary on the wire):
+┌─────────────────────────────────────────────┐
+│ baseOffset        (8 bytes)  = 0             │  ← offset of first record in batch
+│ batchLength       (4 bytes)                  │  ← byte count of everything after this
+│ partitionLeaderEpoch (4 bytes)               │
+│ magic             (1 byte)   = 2             │
+│ crc               (4 bytes)                  │  ← checksum
+│ attributes        (2 bytes)  = 0             │  ← compression type etc.
+│ lastOffsetDelta   (4 bytes)                  │  ← = recordsCount - 1
+│ firstTimestamp    (8 bytes)                  │
+│ maxTimestamp      (8 bytes)                  │
+│ producerId        (8 bytes)                  │
+│ producerEpoch     (2 bytes)                  │
+│ baseSequence      (4 bytes)                  │
+│ recordsCount      (4 bytes)  = 1             │  ← how many records in this batch
+├─────────────────────────────────────────────┤
+│ Record:                                      │
+│   length       (zigzag varint)               │
+│   attributes   (1 byte)                      │
+│   timestampDelta (varint)                    │
+│   offsetDelta  (varint) = 0                  │
+│   key:         null                          │
+│   value:       b'{"traceId":"abc123",...}'   │  ← YOUR JSON as UTF-8 bytes
+│   headers:     []                            │
+└─────────────────────────────────────────────┘
+```
+
+The broker sees **only this blob** — it never decodes your JSON.
+
+---
+
+### Step 3: Broker receives the Produce request and writes to disk
+
+The Produce request wraps the RecordBatch in a `COMPACT_BYTES` envelope on the wire:
+
+```
+PRODUCE request body:
+  topic_data:
+    name: "orders"
+    partition_data:
+      index: 0
+      records: [LEB128 varint(len+1)] [raw RecordBatch bytes ← the blob above]
+```
+
+Your broker:
+1. Reads the varint length to know how many bytes to take
+2. Saves the raw RecordBatch bytes to:
+   `/tmp/kraft-combined-logs/orders-0/00000000000000000000.log`
+
+The file contains the **exact binary RecordBatch** — JSON is in there, just binary-encoded inside the `value` field of the Record.
+
+---
+
+### Step 4: Consumer sends a Fetch request
+
+```python
+records = consumer.poll()
+```
+
+The consumer sends a Fetch request to the broker. Your broker:
+1. Reads the `.log` file from disk
+2. Returns the raw bytes back as-is (no decoding)
+
+---
+
+### Step 5: Consumer decodes the RecordBatch
+
+The consumer's Kafka library:
+1. Parses the RecordBatch binary format
+2. Extracts the `value` bytes from each Record
+3. Deserializes them back to a Python dict
+
+```python
+for msg in records:
+    data = json.loads(msg.value)
+    print(data["traceId"])  # "abc123"
+    print(data["msg"])       # {"event": "click", "userId": 42}
+```
+
+---
+
+### Key insight: Broker = post office
+
+```
+Producer (Python)                                Consumer (Python)
+  dict → JSON bytes                              dict ← JSON bytes
+        ↓                                               ↑
+  Kafka library                                 Kafka library
+  wraps into RecordBatch                        unwraps RecordBatch
+        ↓                                               ↑
+        └──────── Broker (your Go code) ───────────────┘
+                    stores sealed blob
+                    reads sealed blob
+                    never opens it
+```
+
+The broker is a **dumb pipe** — it stores and retrieves opaque binary blobs. All the smarts (serialization, schema, deserialization) live in the producer and consumer libraries.

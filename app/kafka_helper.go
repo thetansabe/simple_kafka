@@ -59,9 +59,12 @@ func (resp *Response) Init(req *Request) {
 			if found {
 				errCode = ErrNone
 			}
-			for _, partIdx := range pt.Partitions {
+			for _, pp := range pt.Partitions {
+				if found {
+					writeProduceLogFile(pt.TopicName, pp.Index, pp.Records)
+				}
 				t.Partitions = append(t.Partitions, Partition{
-					PartitionIndex: partIdx,
+					PartitionIndex: pp.Index,
 					ErrCode:        errCode,
 				})
 			}
@@ -94,7 +97,7 @@ func (resp *Response) ConstructResponseForProduce() []byte {
 		for _, p := range topic.Partitions {
 			res = append(res, byte(p.PartitionIndex>>24), byte(p.PartitionIndex>>16), byte(p.PartitionIndex>>8), byte(p.PartitionIndex)) // index (int32)
 			res = append(res, byte(p.ErrCode>>8), byte(p.ErrCode))                                                                       // error_code (int16)
-			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)                                                           // base_offset (int64)
+			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)                                                            // base_offset (int64)
 			res = append(res, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff)                                                            // log_append_time_ms = -1 (int64)
 			res = append(res, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff)                                                            // log_start_offset = -1 (int64)
 			res = append(res, 0x01)                                                                                                      // record_errors: empty compact array
@@ -305,18 +308,22 @@ func RecieveRequest(conn net.Conn) (*Request, error) {
 			numPartitions := int(buf[cursor]) - 1 // compact array
 			cursor++
 
-			partitions := make([]int32, 0, numPartitions)
+			partitions := make([]ProducePartition, 0, numPartitions)
 			for range numPartitions {
 				partIdx := int32(buf[cursor])<<24 | int32(buf[cursor+1])<<16 | int32(buf[cursor+2])<<8 | int32(buf[cursor+3])
 				cursor += 4
-				// skip records: compact bytes (LEB128 varint length, then raw bytes)
-				recordsLen, newCursor := readUvarint(buf, cursor)
+				// records: compact bytes — LEB128(actualLen+1) then actualLen raw bytes
+				recordsCompactLen, newCursor := readUvarint(buf, cursor)
 				cursor = newCursor
-				if recordsLen > 1 {
-					cursor += recordsLen - 1 // actual bytes = compactLen - 1
+				var recordBytes []byte
+				actualLen := recordsCompactLen - 1
+				if actualLen > 0 {
+					recordBytes = make([]byte, actualLen)
+					copy(recordBytes, buf[cursor:cursor+actualLen])
+					cursor += actualLen
 				}
 				cursor++ // TAG_BUFFER per partition
-				partitions = append(partitions, partIdx)
+				partitions = append(partitions, ProducePartition{Index: partIdx, Records: recordBytes})
 			}
 			cursor++ // TAG_BUFFER per topic
 
@@ -657,4 +664,21 @@ func readLogFileToMap() (map[[16]byte]LogMetadata, error) {
 	log.Println("ParseClusterMetadataLog didn't fail")
 
 	return m, nil
+}
+
+// writeProduceLogFile appends a RecordBatch to the partition log file.
+// The raw RecordBatch bytes come directly from the produce request wire format.
+func writeProduceLogFile(topicName string, partitionIdx int32, records []byte) error {
+	dir := fmt.Sprintf("/tmp/kraft-combined-logs/%s-%d", topicName, partitionIdx)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	filePath := fmt.Sprintf("%s/00000000000000000000.log", dir)
+	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(records)
+	return err
 }
