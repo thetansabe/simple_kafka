@@ -190,3 +190,62 @@ Casting to `int32` first widens it to 32 bits, giving the shift room to work:
 ```go
 int32(buf[8]) << 24  // ✓ 32-bit integer with plenty of room
 ```
+
+---
+
+## Endianness
+
+### What is it?
+
+When a multi-byte number like `int32(0x12345678)` is stored in memory, which byte goes first?
+
+- **Big-endian (BE)** — most significant byte first (how humans write numbers)
+- **Little-endian (LE)** — least significant byte first (how x86/ARM CPUs work)
+
+```
+value: 0x12345678
+
+Big-endian in memory:    [0x12] [0x34] [0x56] [0x78]   ← index 0 is MSB
+Little-endian in memory: [0x78] [0x56] [0x34] [0x12]   ← index 0 is LSB
+```
+
+### Where each applies
+
+| Where | Endian | Why |
+|---|---|---|
+| Your RAM (Go variables) | Little-endian | CPU architecture (x86/ARM) |
+| Kafka TCP wire bytes | Big-endian | Network byte order standard |
+
+All languages on x86/ARM store variables as little-endian in RAM — it's the CPU that decides, not the language.
+
+| Language | RAM storage | Notes |
+|---|---|---|
+| Go | Little-endian | |
+| C / C++ | Little-endian | on x86/ARM |
+| Java | **Big-endian** | ⚠️ JVM spec forces BE regardless of CPU |
+| Python | Little-endian | |
+| Rust | Little-endian | |
+| JavaScript | Little-endian | TypedArray follows CPU |
+
+Java is the famous exception — the JVM standardized on big-endian for "write once, run anywhere". That's why Kafka (written in Java) uses big-endian on the wire: it was natural for Java devs.
+
+### Why you only care at the boundary
+
+You never manually read bytes out of a Go `int32` variable — Go handles that internally. You only deal with endianness when **serializing/deserializing** (network sockets, binary file formats).
+
+When you read from the Kafka socket (big-endian bytes) into a Go variable (little-endian RAM):
+
+```go
+// network bytes → Go variable: manually reassemble big-endian bytes into a value
+correlation_id := int32(buf[8])<<24 | int32(buf[9])<<16 | int32(buf[10])<<8 | int32(buf[11])
+
+// the VALUE in correlation_id is now correct ✓
+// Go stores it little-endian in RAM internally — you don't care
+```
+
+When you write back (Go variable → big-endian wire bytes):
+
+```go
+// Go variable → network bytes: extract each byte MSB first
+byte(correlation_id >> 24), byte(correlation_id >> 16), byte(correlation_id >> 8), byte(correlation_id)
+```

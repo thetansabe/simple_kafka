@@ -81,9 +81,9 @@ func (resp *Response) ConstructResponseForFetch() []byte {
 
 			if !exists {
 				res = append(res, byte(UNKNOWN_TOPIC_ID>>8), byte(UNKNOWN_TOPIC_ID)) // error_code = 100
-				res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)   // high_watermark
-				res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)   // last_stable_offset
-				res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)   // log_start_offset
+				res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)    // high_watermark
+				res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)    // last_stable_offset
+				res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)    // log_start_offset
 				res = append(res, 0x01)                                              // aborted_transactions: empty
 				res = append(res, 0xff, 0xff, 0xff, 0xff)                            // preferred_read_replica: -1
 				res = append(res, 0x01)                                              // records: empty
@@ -98,19 +98,34 @@ func (resp *Response) ConstructResponseForFetch() []byte {
 				records = nil
 			}
 
-			highWatermark := int64(len(metadata.Partitions)) // number of messages = number of partitions in metadata? no — use records count
-			// high_watermark = next offset after the last message; for 1 message it's 1
-			if records != nil {
-				highWatermark = 1 // will be improved in fd8 (multiple messages)
+			highWatermark := int64(0)
+
+			// to know how many messages are in the partition, it inside record count field
+			// https://kafka.apache.org/43/implementation/message-format/#record-batch
+			// offset 57-60: recordsCount (4 bytes) ← THIS
+			// offset 61: records: [Record]
+			// why we store highWatermark = baseOffset + recordsCount
+			// because the file name 00000000000000000000.log is also baseOffset = 0
+			// so highWatermark = baseOffset + recordsCount = 0 + recordsCount = recordsCount
+
+			// EXPLAINATION why we store highWatermark = baseOffset + recordsCount
+			// a partition can have many batch of messages comes at different time
+			// in replication scenario, maybe the follower node don't have all messages
+			// to know which cursor the follower already have, we need to store as highWatermark
+			if len(records) >= 61 {
+				recordsCount := int64(records[57])<<24 | int64(records[58])<<16 | int64(records[59])<<8 | int64(records[60])
+				highWatermark = recordsCount
+			} else if records != nil {
+				highWatermark = 1
 			}
 
-			res = append(res, byte(ErrNone>>8), byte(ErrNone))                                        // error_code = 0
+			res = append(res, byte(ErrNone>>8), byte(ErrNone)) // error_code = 0
 			res = append(res, byte(highWatermark>>56), byte(highWatermark>>48), byte(highWatermark>>40), byte(highWatermark>>32),
 				byte(highWatermark>>24), byte(highWatermark>>16), byte(highWatermark>>8), byte(highWatermark)) // high_watermark
-			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)                        // last_stable_offset
-			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)                        // log_start_offset
-			res = append(res, 0x01)                                                                    // aborted_transactions: empty
-			res = append(res, 0xff, 0xff, 0xff, 0xff)                                                  // preferred_read_replica: -1
+			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00) // last_stable_offset
+			res = append(res, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00) // log_start_offset
+			res = append(res, 0x01)                                           // aborted_transactions: empty
+			res = append(res, 0xff, 0xff, 0xff, 0xff)                         // preferred_read_replica: -1
 			// records: compact bytes — length = len(records)+1, then raw bytes
 			res = appendCompactBytes(res, records)
 			res = append(res, 0x00) // TAG_BUFFER
