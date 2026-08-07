@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"io"
 	"log"
 	"net"
@@ -17,15 +18,15 @@ func responseHeaderV1(correlationID int32) []byte {
 }
 
 func appendInt16(res []byte, v int16) []byte {
-	return append(res, byte(v>>8), byte(v))
+	return binary.BigEndian.AppendUint16(res, uint16(v))
 }
 
 func appendInt32(res []byte, v int32) []byte {
-	return append(res, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+	return binary.BigEndian.AppendUint32(res, uint32(v))
 }
 
 func appendInt64(res []byte, v int64) []byte {
-	return append(res, byte(v>>56), byte(v>>48), byte(v>>40), byte(v>>32), byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+	return binary.BigEndian.AppendUint64(res, uint64(v))
 }
 
 func (resp *Response) Init(req *Request) {
@@ -51,7 +52,7 @@ func RecieveRequest(conn net.Conn) (*Request, error) {
 	if _, err := io.ReadFull(conn, sizeBuf[:]); err != nil {
 		return nil, err
 	}
-	msgSize := int(sizeBuf[0])<<24 | int(sizeBuf[1])<<16 | int(sizeBuf[2])<<8 | int(sizeBuf[3])
+	msgSize := int(binary.BigEndian.Uint32(sizeBuf[:]))
 
 	// allocate exact size and read the full message body
 	buf := make([]byte, msgSize+4)
@@ -60,14 +61,14 @@ func RecieveRequest(conn net.Conn) (*Request, error) {
 		return nil, err
 	}
 
-	msg_size := int32(buf[0])<<24 | int32(buf[1])<<16 | int32(buf[2])<<8 | int32(buf[3])
-	api_key := int16(buf[4])<<8 | int16(buf[5])
-	api_version := int16(buf[6])<<8 | int16(buf[7])
-	correlation_id := int32(buf[8])<<24 | int32(buf[9])<<16 | int32(buf[10])<<8 | int32(buf[11])
+	msg_size := int32(binary.BigEndian.Uint32(buf[0:4]))
+	api_key := int16(binary.BigEndian.Uint16(buf[4:6]))
+	api_version := int16(binary.BigEndian.Uint16(buf[6:8]))
+	correlation_id := int32(binary.BigEndian.Uint32(buf[8:12]))
 
 	// parse past client_id (2-byte length prefix) and header tag_buffer
 	// buf[12..13] = client_id length, buf[14..14+len] = client_id, then 1 byte tag_buffer
-	clientIDLen := int(int16(buf[12])<<8 | int16(buf[13]))
+	clientIDLen := int(int16(binary.BigEndian.Uint16(buf[12:14])))
 	cursor := 14 + clientIDLen + 1 // skip client_id bytes + tag_buffer
 
 	req := &Request{
@@ -98,7 +99,7 @@ func RecieveRequest(conn net.Conn) (*Request, error) {
 
 		req.RequestBody = RequestBody{
 			Topics:           topics,
-			RespPartitionLim: int32(buf[cursor])<<24 | int32(buf[cursor+1])<<16 | int32(buf[cursor+2])<<8 | int32(buf[cursor+3]),
+			RespPartitionLim: int32(binary.BigEndian.Uint32(buf[cursor : cursor+4])),
 			Cursor:           buf[cursor+4],
 		}
 	}
@@ -122,11 +123,10 @@ func RecieveRequest(conn net.Conn) (*Request, error) {
 
 			partitions := make([]FetchPartition, 0, numPartitions)
 			for range numPartitions {
-				partitionIndex := int32(buf[cursor])<<24 | int32(buf[cursor+1])<<16 | int32(buf[cursor+2])<<8 | int32(buf[cursor+3])
+				partitionIndex := int32(binary.BigEndian.Uint32(buf[cursor : cursor+4]))
 				cursor += 4
 				cursor += 4 // current_leader_epoch (int32)
-				fetchOffset := int64(buf[cursor])<<56 | int64(buf[cursor+1])<<48 | int64(buf[cursor+2])<<40 | int64(buf[cursor+3])<<32 |
-					int64(buf[cursor+4])<<24 | int64(buf[cursor+5])<<16 | int64(buf[cursor+6])<<8 | int64(buf[cursor+7])
+				fetchOffset := int64(binary.BigEndian.Uint64(buf[cursor : cursor+8]))
 				cursor += 8
 				cursor += 4 // last_fetched_epoch (int32)
 				cursor += 8 // log_start_offset (int64)
@@ -167,7 +167,7 @@ func RecieveRequest(conn net.Conn) (*Request, error) {
 
 			partitions := make([]ProducePartition, 0, numPartitions)
 			for range numPartitions {
-				partIdx := int32(buf[cursor])<<24 | int32(buf[cursor+1])<<16 | int32(buf[cursor+2])<<8 | int32(buf[cursor+3])
+				partIdx := int32(binary.BigEndian.Uint32(buf[cursor : cursor+4]))
 				cursor += 4
 				// records: compact bytes — LEB128(actualLen+1) then actualLen raw bytes
 				recordsCompactLen, newCursor := readUvarint(buf, cursor)
@@ -211,9 +211,7 @@ func (resp *Response) SendResp(conn net.Conn, req *Request) error {
 
 	// frame is the first 4 bytes of the response, which is the size of the response
 	// so it also means this is msgSize
-	frame := []byte{
-		byte(msgSize >> 24), byte(msgSize >> 16), byte(msgSize >> 8), byte(msgSize),
-	}
+	frame := binary.BigEndian.AppendUint32(nil, uint32(msgSize))
 
 	// write the response to the connection
 	_, err := conn.Write(append(frame, res...))

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"log"
 	"os"
 )
@@ -122,13 +123,13 @@ func LogMetadataMapByUuid(content []byte) map[[16]byte]LogMetadata {
 	m := make(map[[16]byte]LogMetadata)
 
 	// skip batch 1 (only contains FeatureLevel/Broker records, no topic/partition data)
-	batch1Len := int(content[8])<<24 | int(content[9])<<16 | int(content[10])<<8 | int(content[11])
+	batch1Len := int(binary.BigEndian.Uint32(content[8:12]))
 	batchStart := 12 + batch1Len
 
 	// now the log file contains many batches, each containing a topic record and one or more partition records
 	// we need to read all batches
 	for batchStart+12 <= len(content) {
-		batchLen := int(content[batchStart+8])<<24 | int(content[batchStart+9])<<16 | int(content[batchStart+10])<<8 | int(content[batchStart+11])
+		batchLen := int(binary.BigEndian.Uint32(content[batchStart+8 : batchStart+12]))
 		batchEnd := batchStart + 12 + batchLen
 		if batchEnd > len(content) {
 			break
@@ -184,7 +185,7 @@ func parseBatchRecords(content []byte, batchStart, batchEnd int, m map[[16]byte]
 		case PartitionRecord:
 			cursor += 4 // skip: value_length last byte + frame_version + type + version
 			partition := Partition{
-				PartitionIndex: int32(content[cursor])<<24 | int32(content[cursor+1])<<16 | int32(content[cursor+2])<<8 | int32(content[cursor+3]),
+				PartitionIndex: int32(binary.BigEndian.Uint32(content[cursor : cursor+4])),
 			}
 			cursor += 4
 
@@ -195,14 +196,14 @@ func parseBatchRecords(content []byte, batchStart, batchEnd int, m map[[16]byte]
 			replicaLen := int(content[cursor]) - 1
 			cursor++
 			for range replicaLen {
-				partition.ReplicaNodes = append(partition.ReplicaNodes, int32(content[cursor])<<24|int32(content[cursor+1])<<16|int32(content[cursor+2])<<8|int32(content[cursor+3]))
+				partition.ReplicaNodes = append(partition.ReplicaNodes, int32(binary.BigEndian.Uint32(content[cursor:cursor+4])))
 				cursor += 4
 			}
 
 			isrLen := int(content[cursor]) - 1
 			cursor++
 			for range isrLen {
-				partition.IsrNodes = append(partition.IsrNodes, int32(content[cursor])<<24|int32(content[cursor+1])<<16|int32(content[cursor+2])<<8|int32(content[cursor+3]))
+				partition.IsrNodes = append(partition.IsrNodes, int32(binary.BigEndian.Uint32(content[cursor:cursor+4])))
 				cursor += 4
 			}
 
@@ -212,9 +213,9 @@ func parseBatchRecords(content []byte, batchStart, batchEnd int, m map[[16]byte]
 			addingLen := int(content[cursor]) - 1
 			cursor += 1 + addingLen*4
 
-			partition.LeaderID = int32(content[cursor])<<24 | int32(content[cursor+1])<<16 | int32(content[cursor+2])<<8 | int32(content[cursor+3])
+			partition.LeaderID = int32(binary.BigEndian.Uint32(content[cursor : cursor+4]))
 			cursor += 4
-			partition.LeaderEpoch = int32(content[cursor])<<24 | int32(content[cursor+1])<<16 | int32(content[cursor+2])<<8 | int32(content[cursor+3])
+			partition.LeaderEpoch = int32(binary.BigEndian.Uint32(content[cursor : cursor+4]))
 			cursor += 4
 
 			m[topicUUID] = LogMetadata{

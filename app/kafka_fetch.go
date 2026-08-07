@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 )
@@ -74,15 +75,14 @@ func (resp *Response) ConstructResponseForFetch() []byte {
 			highWatermark := int64(0)
 			recordsToSend := []byte{}
 			for pos := 0; pos+12 <= len(records); {
-				baseOff := int64(records[pos])<<56 | int64(records[pos+1])<<48 | int64(records[pos+2])<<40 | int64(records[pos+3])<<32 |
-					int64(records[pos+4])<<24 | int64(records[pos+5])<<16 | int64(records[pos+6])<<8 | int64(records[pos+7])
-				batchLen := int(records[pos+8])<<24 | int(records[pos+9])<<16 | int(records[pos+10])<<8 | int(records[pos+11])
+				baseOff := int64(binary.BigEndian.Uint64(records[pos : pos+8]))
+				batchLen := int(binary.BigEndian.Uint32(records[pos+8 : pos+12]))
 				batchEnd := pos + 12 + batchLen
 				if batchEnd > len(records) {
 					break
 				}
 				if pos+61 <= len(records) {
-					recordsCount := int64(records[pos+57])<<24 | int64(records[pos+58])<<16 | int64(records[pos+59])<<8 | int64(records[pos+60])
+					recordsCount := int64(binary.BigEndian.Uint32(records[pos+57 : pos+61]))
 					highWatermark = baseOff + recordsCount
 					// include this batch only if it contains offsets >= fetch_offset
 					lastOffsetInBatch := baseOff + recordsCount - 1
